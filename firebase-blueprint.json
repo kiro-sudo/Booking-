@@ -1,0 +1,239 @@
+{
+  "entities": {
+    "TravelDate": {
+      "title": "TravelDate",
+      "description": "Preconfigured trip departure date with daily passenger capacity and confirmed booking counter.",
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "description": "ISO calendar date (YYYY-MM-DD).",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-readable travel date label.",
+          "minLength": 3,
+          "maxLength": 64
+        },
+        "capacity": {
+          "type": "integer",
+          "description": "Maximum confirmed bookings allowed for this travel date."
+        },
+        "bookedCount": {
+          "type": "integer",
+          "description": "Current number of confirmed bookings assigned to this date."
+        },
+        "isOpen": {
+          "type": "boolean",
+          "description": "Whether this date is open for automatic assignment."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the travel date was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the travel date was last updated."
+        }
+      },
+      "required": ["date", "label", "capacity", "bookedCount", "isOpen", "createdAt", "updatedAt"]
+    },
+    "BookingCounter": {
+      "title": "BookingCounter",
+      "description": "Global monotonic sequence counter for generating BT-1, BT-2, ... booking numbers.",
+      "type": "object",
+      "properties": {
+        "lastNumber": {
+          "type": "integer",
+          "description": "Highest issued sequential booking number."
+        },
+        "lastBookingId": {
+          "type": "string",
+          "description": "Document ID of the most recently issued booking or INIT.",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last counter update."
+        }
+      },
+      "required": ["lastNumber", "lastBookingId", "updatedAt"]
+    },
+    "PhoneLock": {
+      "title": "PhoneLock",
+      "description": "Uniqueness lock keyed by SHA-256 hash of normalized phone number to prevent duplicate bookings without exposing PII.",
+      "type": "object",
+      "properties": {
+        "bookingId": {
+          "type": "string",
+          "description": "SHA-256 lookup ID of the linked booking.",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "bookingNumber": {
+          "type": "string",
+          "description": "Assigned sequential booking number (BT-N).",
+          "minLength": 4,
+          "maxLength": 32,
+          "pattern": "^BT-[1-9][0-9]*$"
+        },
+        "nameHash": {
+          "type": "string",
+          "description": "SHA-256 hash of the normalized customer name.",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the lock was created."
+        }
+      },
+      "required": ["bookingId", "bookingNumber", "nameHash", "createdAt"]
+    },
+    "Booking": {
+      "title": "Booking",
+      "description": "Confirmed customer boat trip booking record keyed by SHA-256(normalizedName + '|' + normalizedPhone).",
+      "type": "object",
+      "properties": {
+        "bookingNumber": {
+          "type": "string",
+          "description": "Global sequential booking number (BT-1, BT-2, ...).",
+          "minLength": 4,
+          "maxLength": 32,
+          "pattern": "^BT-[1-9][0-9]*$"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Customer display name.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "normalizedName": {
+          "type": "string",
+          "description": "Normalized lowercase customer name.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "phone": {
+          "type": "string",
+          "description": "Customer phone number as entered.",
+          "minLength": 6,
+          "maxLength": 30
+        },
+        "normalizedPhone": {
+          "type": "string",
+          "description": "Normalized phone digits.",
+          "minLength": 6,
+          "maxLength": 24,
+          "pattern": "^[0-9+]{6,24}$"
+        },
+        "phoneHash": {
+          "type": "string",
+          "description": "SHA-256 hex digest of normalizedPhone.",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "travelDateId": {
+          "type": "string",
+          "description": "Assigned travelDates document ID.",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "travelDateLabel": {
+          "type": "string",
+          "description": "Human-readable assigned travel date.",
+          "minLength": 3,
+          "maxLength": 64
+        },
+        "status": {
+          "type": "string",
+          "enum": ["Confirmed"],
+          "description": "Booking confirmation status."
+        },
+        "tripName": {
+          "type": "string",
+          "description": "Boat trip name at time of booking.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-generated booking timestamp."
+        }
+      },
+      "required": [
+        "bookingNumber",
+        "customerName",
+        "normalizedName",
+        "phone",
+        "normalizedPhone",
+        "phoneHash",
+        "travelDateId",
+        "travelDateLabel",
+        "status",
+        "tripName",
+        "createdAt"
+      ]
+    },
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Authorized admin account entry mapped by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Verified admin email address.",
+          "minLength": 5,
+          "maxLength": 160
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin"],
+          "description": "Role identifier."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp."
+        }
+      },
+      "required": ["email", "role", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/travelDates/{dateId}": {
+      "schema": { "$ref": "#/entities/TravelDate" },
+      "description": "Preconfigured boat trip departure dates and daily booking limits."
+    },
+    "/counters/{counterId}": {
+      "schema": { "$ref": "#/entities/BookingCounter" },
+      "description": "Global sequential booking number counter (document ID: booking)."
+    },
+    "/phoneLocks/{phoneHash}": {
+      "schema": { "$ref": "#/entities/PhoneLock" },
+      "description": "Per-phone uniqueness locks preventing duplicate bookings across customers."
+    },
+    "/bookings/{bookingId}": {
+      "schema": { "$ref": "#/entities/Booking" },
+      "description": "Confirmed customer bookings keyed by SHA-256(normalizedName + '|' + normalizedPhone)."
+    },
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "Authorized Firebase Admin UIDs."
+    }
+  }
+}
