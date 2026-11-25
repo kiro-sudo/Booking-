@@ -1,4 +1,4 @@
-Horizon type { Metadata } from 'next';
+import type { Metadata } from 'next';
 import {
   Outfit,
   Plus_Jakarta_Sans,
