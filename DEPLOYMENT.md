@@ -1,4 +1,4 @@
-# Irrawaddy Horizon Boat Trips — Setup & Deployment Guide
+# Mergui Horizon Boat Trips — Setup & Deployment Guide
 
 ## 1. Environment Variables Setup
 
