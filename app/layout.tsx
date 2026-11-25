@@ -1,4 +1,4 @@
-import type { Metadata } from 'next';
+Horizon type { Metadata } from 'next';
 import {
   Outfit,
   Plus_Jakarta_Sans,
@@ -37,18 +37,18 @@ const notoMyanmar = Noto_Sans_Myanmar({
 });
 
 export const metadata: Metadata = {
-  title: 'Irrawaddy Horizon Boat Trips',
+  title: 'Mergui Horizon Boat Trips',
   description:
     'Mobile-friendly recreational boat trip booking website with automatic travel date assignment, PNG booking receipts, lookup, and admin capacity management.',
   openGraph: {
-    title: 'Irrawaddy Horizon Boat Trips',
+    title: 'Mergui Horizon Boat Trips',
     description:
       'Mobile-friendly recreational boat trip booking website with automatic travel date assignment, PNG booking receipts, lookup, and admin capacity management.',
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Irrawaddy Horizon Boat Trips',
+    title: 'Mergui Horizon Boat Trips',
     description:
       'Mobile-friendly recreational boat trip booking website with automatic travel date assignment, PNG booking receipts, lookup, and admin capacity management.',
   },
