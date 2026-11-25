@@ -1,5 +1,5 @@
 {
-  "name": "Irrawaddy Horizon Boat Trips",
+  "name": "Mergui Horizon Boat Trips",
   "description": "Mobile-friendly recreational boat trip booking website with automatic travel date assignment, PNG booking receipts, lookup, and admin capacity management.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
