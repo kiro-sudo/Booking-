@@ -121,10 +121,12 @@ export async function downloadBookingReceiptPng(
   ctx.font = '700 54px "JetBrains Mono", monospace';
   ctx.fillText(booking.bookingNumber, padX + 28, stripY + 106);
 
-  // Confirmed badge on right
-  ctx.fillStyle = '#0F766E';
+  // Status badge on right
+  const isCancelled = booking.status === 'Cancelled';
+  const statusLabel = isCancelled ? t.statusCancelled : t.statusConfirmed;
+  ctx.fillStyle = isCancelled ? '#BE123C' : '#0F766E';
   ctx.font = '700 22px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
-  const statusText = `✓ ${t.statusConfirmed}`;
+  const statusText = isCancelled ? `✕ ${statusLabel}` : `✓ ${statusLabel}`;
   const statusWidth = ctx.measureText(statusText).width;
   ctx.fillText(statusText, padX + innerW - statusWidth - 28, stripY + 96);
 
@@ -138,7 +140,7 @@ export async function downloadBookingReceiptPng(
       value: formatServerTimestamp(booking.createdAtMs, locale),
       mono: true,
     },
-    { label: t.receiptStatus, value: t.statusConfirmed },
+    { label: t.receiptStatus, value: statusLabel },
   ];
 
   let rowY = stripY + 178;
@@ -147,7 +149,7 @@ export async function downloadBookingReceiptPng(
     ctx.font = '500 20px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
     ctx.fillText(row.label, padX, rowY);
 
-    ctx.fillStyle = '#0F172A';
+    ctx.fillStyle = index === rows.length - 1 && isCancelled ? '#BE123C' : '#0F172A';
     ctx.font = row.mono
       ? '600 24px "JetBrains Mono", "Noto Sans Myanmar", monospace'
       : '600 26px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
@@ -167,41 +169,56 @@ export async function downloadBookingReceiptPng(
     rowY += 92;
   });
 
-  // Boarding & Payment Instructions Box
+  // Boarding & Payment Instructions Box (or Cancelled Notice)
   const noticeY = cardY + cardH - 224;
-  ctx.fillStyle = '#F0FDFA';
+  ctx.fillStyle = isCancelled ? '#FFF1F2' : '#F0FDFA';
   ctx.beginPath();
   ctx.roundRect(padX, noticeY, innerW, 176, 16);
   ctx.fill();
-  ctx.strokeStyle = '#99F6E4';
+  ctx.strokeStyle = isCancelled ? '#FECDD3' : '#99F6E4';
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  ctx.fillStyle = '#0F3D5E';
-  ctx.font = '700 22px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
-  const payLines = wrapText(ctx, trip.paymentRule, innerW - 48);
-  payLines.slice(0, 1).forEach((line, i) => {
-    ctx.fillText(line, padX + 24, noticeY + 42 + i * 28);
-  });
+  if (isCancelled) {
+    ctx.fillStyle = '#9F1239';
+    ctx.font = '700 22px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
+    const cancelLines = wrapText(ctx, t.cancelledReceiptNote, innerW - 48);
+    cancelLines.slice(0, 3).forEach((line, i) => {
+      ctx.fillText(line, padX + 24, noticeY + 64 + i * 32);
+    });
+  } else {
+    ctx.fillStyle = '#0F3D5E';
+    ctx.font = '700 22px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
+    const payLines = wrapText(ctx, trip.paymentRule, innerW - 48);
+    payLines.slice(0, 1).forEach((line, i) => {
+      ctx.fillText(line, padX + 24, noticeY + 42 + i * 28);
+    });
 
-  ctx.fillStyle = '#0F766E';
-  ctx.font = '600 19px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
-  const boardLines = wrapText(ctx, trip.boardingRule, innerW - 48);
-  boardLines.slice(0, 1).forEach((line, i) => {
-    ctx.fillText(line, padX + 24, noticeY + 86 + i * 26);
-  });
+    ctx.fillStyle = '#0F766E';
+    ctx.font = '600 19px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
+    const boardLines = wrapText(ctx, trip.boardingRule, innerW - 48);
+    boardLines.slice(0, 1).forEach((line, i) => {
+      ctx.fillText(line, padX + 24, noticeY + 86 + i * 26);
+    });
 
-  ctx.fillStyle = '#475569';
-  ctx.font = '500 18px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
-  const pierLines = wrapText(ctx, trip.pier, innerW - 48);
-  pierLines.slice(0, 2).forEach((line, i) => {
-    ctx.fillText(line, padX + 24, noticeY + 128 + i * 24);
-  });
+    ctx.fillStyle = '#475569';
+    ctx.font = '500 18px "Noto Sans Myanmar", "Plus Jakarta Sans", sans-serif';
+    const pierLines = wrapText(ctx, trip.pier, innerW - 48);
+    pierLines.slice(0, 2).forEach((line, i) => {
+      ctx.fillText(line, padX + 24, noticeY + 128 + i * 24);
+    });
+  }
 
-  // Trigger download
+  // Trigger download (include travel date since BT-N resets per travel date)
+  const dateSlug = booking.travelDateLabel
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
   const dataUrl = canvas.toDataURL('image/png');
   const link = document.createElement('a');
-  link.download = `${booking.bookingNumber}-receipt.png`;
+  link.download = dateSlug
+    ? `${booking.bookingNumber}-${dateSlug}-receipt.png`
+    : `${booking.bookingNumber}-receipt.png`;
   link.href = dataUrl;
   document.body.appendChild(link);
   link.click();

@@ -4,31 +4,50 @@ import React, { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
   AlertCircle,
+  Ban,
+  Calendar,
   CalendarPlus,
   CheckCircle2,
   Clock,
   Download,
   Edit3,
   Eye,
+  Layers,
+  List,
   Lock,
   LogOut,
+  Phone,
   Search,
+  Send,
   ShieldCheck,
   Ship,
-  Trash2,
+  Users,
   X,
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
-import { collection, onSnapshot, orderBy, query, Timestamp } from 'firebase/firestore';
+import { collection, doc, onSnapshot, orderBy, query, Timestamp } from 'firebase/firestore';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from '@/lib/firebase';
 import {
+  adminCancelBooking,
   adminCreateTravelDate,
-  adminDeleteBooking,
+  adminFetchBookingsByTravelDate,
+  adminSaveContactSettings,
   adminUpdateTravelDate,
   BookingRecord,
+  ContactSettingsRecord,
+  normalizeTelegramLink,
+  normalizeTelHref,
+  parseBookingSequence,
   TravelDateRecord,
 } from '@/lib/booking-helpers';
-import { formatServerTimestamp, getTripCapacityState, Locale, TRIP_INFO } from '@/lib/i18n';
+import {
+  formatBookingDateOnly,
+  formatBookingTimeOnly,
+  formatServerTimestamp,
+  getTripCapacityState,
+  Locale,
+  TRIP_INFO,
+} from '@/lib/i18n';
 import { BookingReceiptCard } from './BookingReceiptCard';
 
 const ADMIN_ALLOWLIST_EMAIL = 'zwalpyaes@gmail.com';
@@ -63,10 +82,11 @@ export function AdminPortal() {
   // Search & filter state
   const [searchQuery, setSearchQuery] = useState('');
   const [dateFilterId, setDateFilterId] = useState<string>('all');
+  const [summaryDateFilterId, setSummaryDateFilterId] = useState<string>('all');
   const [selectedBooking, setSelectedBooking] = useState<BookingRecord | null>(null);
-  const [bookingToDelete, setBookingToDelete] = useState<BookingRecord | null>(null);
-  const [deletingBooking, setDeletingBooking] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [bookingToCancel, setBookingToCancel] = useState<BookingRecord | null>(null);
+  const [cancellingBooking, setCancellingBooking] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   // Add travel date form state
   const [newDate, setNewDate] = useState('');
@@ -84,8 +104,24 @@ export function AdminPortal() {
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
-  // Active dashboard tab on mobile/desktop
-  const [activeTab, setActiveTab] = useState<'bookings' | 'capacity'>('bookings');
+  // Customer support contact settings state
+  const [contactSettings, setContactSettings] = useState<ContactSettingsRecord>({
+    adminPhone: '',
+    telegramInput: '',
+    updatedAtMs: 0,
+  });
+  const [phoneDraft, setPhoneDraft] = useState<string | null>(null);
+  const [telegramDraft, setTelegramDraft] = useState<string | null>(null);
+  const [savingContact, setSavingContact] = useState(false);
+  const [contactError, setContactError] = useState<string | null>(null);
+  const [contactSuccess, setContactSuccess] = useState<string | null>(null);
+
+  // Active dashboard tab, booking grouping view mode & date-based CSV export state
+  const [activeTab, setActiveTab] = useState<'bookings' | 'capacity' | 'support'>('bookings');
+  const [bookingViewMode, setBookingViewMode] = useState<'grouped' | 'table'>('grouped');
+  const [exportDateId, setExportDateId] = useState<string>('');
+  const [exportingCsv, setExportingCsv] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // Check server-side admin session
   useEffect(() => {
@@ -173,11 +209,14 @@ export function AdminPortal() {
             phone: String(data.phone ?? ''),
             normalizedPhone: String(data.normalizedPhone ?? ''),
             phoneHash: String(data.phoneHash ?? ''),
+            datePhoneHash: typeof data.datePhoneHash === 'string' ? data.datePhoneHash : undefined,
             travelDateId: String(data.travelDateId ?? ''),
             travelDateLabel: String(data.travelDateLabel ?? ''),
-            status: 'Confirmed',
+            status: data.status === 'Cancelled' ? 'Cancelled' : 'Confirmed',
             tripName: String(data.tripName ?? TRIP_INFO.en.name),
             createdAtMs: data.createdAt instanceof Timestamp ? data.createdAt.toMillis() : 0,
+            cancelledAtMs:
+              data.cancelledAt instanceof Timestamp ? data.cancelledAt.toMillis() : undefined,
           };
         });
         setBookings(list);
@@ -189,9 +228,27 @@ export function AdminPortal() {
       }
     );
 
+    const unsubContact = onSnapshot(
+      doc(db, 'settings', 'contact'),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() as Record<string, unknown>;
+          setContactSettings({
+            adminPhone: String(data.adminPhone ?? ''),
+            telegramInput: String(data.telegramInput ?? ''),
+            updatedAtMs: data.updatedAt instanceof Timestamp ? data.updatedAt.toMillis() : 0,
+          });
+        } else {
+          setContactSettings({ adminPhone: '', telegramInput: '', updatedAtMs: 0 });
+        }
+      },
+      (error) => handleFirestoreError(error, OperationType.GET, 'settings/contact')
+    );
+
     return () => {
       unsubDates();
       unsubBookings();
+      unsubContact();
     };
   }, [isFullyAuthorized, firebaseUser]);
 
@@ -361,21 +418,55 @@ export function AdminPortal() {
     }
   };
 
-  const handleConfirmDeleteBooking = async () => {
-    if (!bookingToDelete || deletingBooking) return;
-    setDeleteError(null);
-    setDeletingBooking(true);
+  const handleConfirmCancelBooking = async () => {
+    if (!bookingToCancel || cancellingBooking) return;
+    if (bookingToCancel.status === 'Cancelled') {
+      setCancelError('This booking has already been cancelled.');
+      return;
+    }
+    setCancelError(null);
+    setCancellingBooking(true);
 
     try {
-      await adminDeleteBooking(bookingToDelete);
-      if (selectedBooking?.id === bookingToDelete.id) {
-        setSelectedBooking(null);
+      const result = await adminCancelBooking(bookingToCancel);
+      if (result.status === 'already_cancelled') {
+        setCancelError('This booking was already cancelled.');
+        return;
       }
-      setBookingToDelete(null);
+      if (result.status === 'not_found') {
+        setCancelError('Booking record could not be found.');
+        return;
+      }
+      setBookingToCancel(null);
     } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : 'Failed to delete booking.');
+      setCancelError(err instanceof Error ? err.message : 'Failed to cancel booking.');
     } finally {
-      setDeletingBooking(false);
+      setCancellingBooking(false);
+    }
+  };
+
+  const adminPhoneValue = phoneDraft ?? contactSettings.adminPhone;
+  const telegramInputValue = telegramDraft ?? contactSettings.telegramInput;
+
+  const handleSaveContactSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (savingContact) return;
+    setContactError(null);
+    setContactSuccess(null);
+    setSavingContact(true);
+
+    try {
+      const saved = await adminSaveContactSettings(adminPhoneValue, telegramInputValue);
+      setContactSettings(saved);
+      setPhoneDraft(null);
+      setTelegramDraft(null);
+      setContactSuccess('Customer support contact settings saved and published.');
+    } catch (err) {
+      setContactError(
+        err instanceof Error ? err.message : 'Failed to save customer support contact settings.'
+      );
+    } finally {
+      setSavingContact(false);
     }
   };
 
@@ -393,19 +484,120 @@ export function AdminPortal() {
     });
   }, [bookings, searchQuery, dateFilterId]);
 
+  const groupedBookings = useMemo(() => {
+    const byDateId = new Map<string, BookingRecord[]>();
+    filteredBookings.forEach((b) => {
+      const list = byDateId.get(b.travelDateId) ?? [];
+      list.push(b);
+      byDateId.set(b.travelDateId, list);
+    });
+
+    const hasSearch = searchQuery.trim().length > 0;
+    const groups: Array<{
+      id: string;
+      label: string;
+      isoDate: string;
+      capacity: number | null;
+      bookedCount: number;
+      isOpen: boolean;
+      bookings: BookingRecord[];
+    }> = [];
+
+    const seenDateIds = new Set<string>();
+    travelDates.forEach((td) => {
+      if (dateFilterId !== 'all' && td.id !== dateFilterId) return;
+      seenDateIds.add(td.id);
+      const items = (byDateId.get(td.id) ?? []).slice().sort(
+        (a, b) => parseBookingSequence(a.bookingNumber) - parseBookingSequence(b.bookingNumber)
+      );
+      if (hasSearch && items.length === 0) return;
+      groups.push({
+        id: td.id,
+        label: td.label,
+        isoDate: td.date,
+        capacity: td.capacity,
+        bookedCount: td.bookedCount,
+        isOpen: td.isOpen,
+        bookings: items,
+      });
+    });
+
+    // Include any bookings referencing a date ID not in travelDates
+    byDateId.forEach((items, tdId) => {
+      if (seenDateIds.has(tdId)) return;
+      const sorted = items
+        .slice()
+        .sort((a, b) => parseBookingSequence(a.bookingNumber) - parseBookingSequence(b.bookingNumber));
+      groups.push({
+        id: tdId,
+        label: sorted[0]?.travelDateLabel ?? tdId,
+        isoDate: '',
+        capacity: null,
+        bookedCount: sorted.length,
+        isOpen: false,
+        bookings: sorted,
+      });
+    });
+
+    return groups;
+  }, [filteredBookings, travelDates, dateFilterId, searchQuery]);
+
+  const dailySummaryRows = useMemo(() => {
+    return travelDates.map((td) => {
+      const dateBookings = bookings.filter((b) => b.travelDateId === td.id);
+      const confirmedBookings = dateBookings.filter((b) => b.status === 'Confirmed').length;
+      const cancelledBookings = dateBookings.filter((b) => b.status === 'Cancelled').length;
+      const totalConfirmedPassengers = confirmedBookings;
+      const remainingSeats = Math.max(0, td.capacity - confirmedBookings);
+      return {
+        id: td.id,
+        date: td.date,
+        label: td.label,
+        capacity: td.capacity,
+        confirmedBookings,
+        cancelledBookings,
+        totalConfirmedPassengers,
+        remainingSeats,
+      };
+    });
+  }, [travelDates, bookings]);
+
+  const visibleSummaryRows = useMemo(() => {
+    if (summaryDateFilterId === 'all') return dailySummaryRows;
+    return dailySummaryRows.filter((row) => row.id === summaryDateFilterId);
+  }, [dailySummaryRows, summaryDateFilterId]);
+
+  const activeSelectedBooking = useMemo(
+    () =>
+      selectedBooking
+        ? bookings.find((b) => b.id === selectedBooking.id) ?? selectedBooking
+        : null,
+    [selectedBooking, bookings]
+  );
+
   const metrics = useMemo(() => {
+    const confirmedBookings = bookings.filter((b) => b.status === 'Confirmed').length;
+    const cancelledBookings = bookings.filter((b) => b.status === 'Cancelled').length;
     const totalCapacity = travelDates.reduce((s, d) => s + d.capacity, 0);
     const totalBooked = travelDates.reduce((s, d) => s + d.bookedCount, 0);
     const remainingCapacity = Math.max(0, totalCapacity - totalBooked);
     const fullDates = travelDates.filter((d) => d.bookedCount >= d.capacity).length;
     return {
-      totalBookings: bookings.length,
+      confirmedBookings,
+      cancelledBookings,
       totalCapacity,
       totalBooked,
       remainingCapacity,
       fullDates,
     };
   }, [bookings, travelDates]);
+
+  const effectiveExportDateId = useMemo(() => {
+    if (exportDateId && travelDates.some((d) => d.id === exportDateId)) {
+      return exportDateId;
+    }
+    return travelDates[0]?.id ?? '';
+  }, [exportDateId, travelDates]);
 
   const handleExportJsonBackup = () => {
     const payload = {
@@ -424,33 +616,53 @@ export function AdminPortal() {
     URL.revokeObjectURL(url);
   };
 
-  const handleExportCsvBackup = () => {
-    const headers = [
-      'Booking Number',
-      'Customer Name',
-      'Phone Number',
-      'Assigned Travel Date',
-      'Booking Date & Time (MMT)',
-      'Status',
-    ];
-    const rows = bookings.map((b) => [
-      b.bookingNumber,
-      `"${b.customerName.replace(/"/g, '""')}"`,
-      `"${b.phone.replace(/"/g, '""')}"`,
-      `"${b.travelDateLabel.replace(/"/g, '""')}"`,
-      `"${formatServerTimestamp(b.createdAtMs, 'en').replace(/"/g, '""')}"`,
-      b.status,
-    ]);
-    const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `boat-bookings-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  const handleExportDateCsv = async () => {
+    if (!effectiveExportDateId || exportingCsv) return;
+    const selectedDate = travelDates.find((d) => d.id === effectiveExportDateId);
+    if (!selectedDate) return;
+
+    setExportError(null);
+    setExportingCsv(true);
+
+    try {
+      const dateBookings = await adminFetchBookingsByTravelDate(effectiveExportDateId);
+      const escapeCsv = (value: string) => `"${value.replace(/"/g, '""')}"`;
+
+      const headers = [
+        'Booking Number',
+        'Customer Name',
+        'Phone Number',
+        'Travel Date',
+        'Booking Date',
+        'Booking Time',
+        'Booking Status',
+      ];
+
+      const rows = dateBookings.map((b) => [
+        escapeCsv(b.bookingNumber),
+        escapeCsv(b.customerName),
+        escapeCsv(b.phone),
+        escapeCsv(b.travelDateLabel),
+        escapeCsv(formatBookingDateOnly(b.createdAtMs)),
+        escapeCsv(formatBookingTimeOnly(b.createdAtMs)),
+        escapeCsv(b.status),
+      ]);
+
+      const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `bookings-${selectedDate.date}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : 'Failed to export CSV.');
+    } finally {
+      setExportingCsv(false);
+    }
   };
 
   // Loading state
@@ -778,23 +990,48 @@ export function AdminPortal() {
             <span className="mx-2" aria-hidden="true">·</span>
             <span className="font-mono text-xs">{firebaseUser?.email}</span>
           </div>
-          <div className="flex flex-wrap items-center gap-2.5">
-            <button
-              type="button"
-              onClick={handleExportCsvBackup}
-              className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer whitespace-nowrap"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>Export CSV</span>
-            </button>
-            <button
-              type="button"
-              onClick={handleExportJsonBackup}
-              className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#0F3D5E] text-white text-xs font-semibold hover:bg-[#0c314c] cursor-pointer whitespace-nowrap"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>Backup JSON</span>
-            </button>
+          <div className="flex flex-col items-start lg:items-end gap-2">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <select
+                value={effectiveExportDateId}
+                onChange={(e) => setExportDateId(e.target.value)}
+                disabled={travelDates.length === 0 || exportingCsv}
+                aria-label="Select travel date for CSV export"
+                className="min-h-[40px] px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0F3D5E]/25 focus:border-[#0F3D5E] disabled:opacity-60"
+              >
+                {travelDates.length === 0 ? (
+                  <option value="">No travel dates</option>
+                ) : (
+                  travelDates.map((td) => (
+                    <option key={td.id} value={td.id}>
+                      {td.label} ({td.date})
+                    </option>
+                  ))
+                )}
+              </select>
+              <button
+                type="button"
+                onClick={handleExportDateCsv}
+                disabled={!effectiveExportDateId || exportingCsv}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{exportingCsv ? 'Exporting...' : 'Export CSV'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleExportJsonBackup}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#0F3D5E] text-white text-xs font-semibold hover:bg-[#0c314c] cursor-pointer whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Backup JSON</span>
+              </button>
+            </div>
+            {exportError && (
+              <p role="alert" className="text-xs text-rose-700 font-medium">
+                {exportError}
+              </p>
+            )}
           </div>
         </div>
 
@@ -802,8 +1039,14 @@ export function AdminPortal() {
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
             <p className="text-xs font-medium text-slate-500">Confirmed Bookings</p>
-            <p className="mt-1.5 font-mono tabular-nums text-2xl font-bold text-slate-900">
-              {metrics.totalBookings}
+            <p className="mt-1.5 font-mono tabular-nums text-2xl font-bold text-teal-700">
+              {metrics.confirmedBookings}
+            </p>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
+            <p className="text-xs font-medium text-slate-500">Cancelled Bookings</p>
+            <p className="mt-1.5 font-mono tabular-nums text-2xl font-bold text-rose-700">
+              {metrics.cancelledBookings}
             </p>
           </div>
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
@@ -813,21 +1056,145 @@ export function AdminPortal() {
             </p>
           </div>
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
-            <p className="text-xs font-medium text-slate-500">Remaining Capacity</p>
-            <p className="mt-1.5 font-mono tabular-nums text-2xl font-bold text-teal-700">
+            <p className="text-xs font-medium text-slate-500">Remaining Seats</p>
+            <p className="mt-1.5 font-mono tabular-nums text-2xl font-bold text-[#0F3D5E]">
               {metrics.remainingCapacity}
-            </p>
-          </div>
-          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
-            <p className="text-xs font-medium text-slate-500">Fully Booked Dates</p>
-            <p className="mt-1.5 font-mono tabular-nums text-2xl font-bold text-amber-700">
-              {metrics.fullDates}
             </p>
           </div>
         </div>
 
+        {/* Daily Passenger Summary */}
+        <section className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+          <div className="p-4 sm:p-6 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <Users className="w-5 h-5 text-[#0F3D5E] shrink-0" />
+              <div>
+                <h2 className="font-display text-lg font-bold text-slate-900">
+                  Daily Passenger Summary
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Live totals per travel date (only Confirmed bookings count toward passengers and
+                  seats used).
+                </p>
+              </div>
+            </div>
+
+            <select
+              value={summaryDateFilterId}
+              onChange={(e) => setSummaryDateFilterId(e.target.value)}
+              aria-label="Filter daily passenger summary by travel date"
+              className="min-h-[40px] px-3 py-1.5 rounded-xl border border-slate-300 bg-white text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0F3D5E]/25 focus:border-[#0F3D5E]"
+            >
+              <option value="all">All Travel Dates ({dailySummaryRows.length})</option>
+              {dailySummaryRows.map((row) => (
+                <option key={row.id} value={row.id}>
+                  {row.label} ({row.date})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {dataLoading ? (
+            <div className="p-5 space-y-2.5">
+              <div className="h-10 bg-slate-100 rounded-lg animate-pulse" />
+              <div className="h-10 bg-slate-100 rounded-lg animate-pulse" />
+            </div>
+          ) : visibleSummaryRows.length === 0 ? (
+            <div className="p-8 text-center text-sm text-slate-500">
+              No travel dates configured yet.
+            </div>
+          ) : (
+            <>
+              <div className="hidden md:block overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+                      <th className="py-3 px-5">Travel Date</th>
+                      <th className="py-3 px-4 text-right">Total Capacity</th>
+                      <th className="py-3 px-4 text-right">Confirmed Bookings</th>
+                      <th className="py-3 px-4 text-right">Cancelled Bookings</th>
+                      <th className="py-3 px-4 text-right">Total Confirmed Passengers</th>
+                      <th className="py-3 px-5 text-right">Remaining Seats</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 text-sm">
+                    {visibleSummaryRows.map((row) => (
+                      <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
+                        <td className="py-3.5 px-5">
+                          <p className="font-semibold text-slate-900 whitespace-nowrap">
+                            {row.label}
+                          </p>
+                          <p className="font-mono text-xs text-slate-500">{row.date}</p>
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-800">
+                          {row.capacity}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-teal-700">
+                          {row.confirmedBookings}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-rose-700">
+                          {row.cancelledBookings}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums font-bold text-slate-900">
+                          {row.totalConfirmedPassengers}
+                        </td>
+                        <td className="py-3.5 px-5 text-right font-mono tabular-nums font-bold text-[#0F3D5E]">
+                          {row.remainingSeats}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="md:hidden divide-y divide-slate-200">
+                {visibleSummaryRows.map((row) => (
+                  <div key={row.id} className="p-4 space-y-2.5">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <p className="font-semibold text-slate-900">{row.label}</p>
+                      <span className="font-mono text-xs text-slate-500">{row.date}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div className="p-2 rounded-lg bg-slate-50">
+                        <span className="text-slate-500 block">Total Capacity</span>
+                        <span className="font-mono tabular-nums font-bold text-slate-900">
+                          {row.capacity}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-lg bg-slate-50">
+                        <span className="text-slate-500 block">Remaining Seats</span>
+                        <span className="font-mono tabular-nums font-bold text-[#0F3D5E]">
+                          {row.remainingSeats}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-lg bg-teal-50/70">
+                        <span className="text-teal-800 block">Confirmed Bookings</span>
+                        <span className="font-mono tabular-nums font-bold text-teal-800">
+                          {row.confirmedBookings}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-lg bg-rose-50/70">
+                        <span className="text-rose-800 block">Cancelled Bookings</span>
+                        <span className="font-mono tabular-nums font-bold text-rose-800">
+                          {row.cancelledBookings}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-xs text-slate-600 font-medium">
+                      Total Confirmed Passengers:{' '}
+                      <span className="font-mono tabular-nums font-bold text-slate-900">
+                        {row.totalConfirmedPassengers}
+                      </span>
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+
         {/* Segmented Tab Controls */}
-        <div className="inline-flex items-center gap-1 p-1 bg-slate-200/70 rounded-xl">
+        <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-xl">
           <button
             type="button"
             onClick={() => setActiveTab('bookings')}
@@ -850,12 +1217,23 @@ export function AdminPortal() {
           >
             Trip Capacity Management ({travelDates.length})
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('support')}
+            className={`min-h-[40px] px-4 py-2 rounded-lg text-sm font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+              activeTab === 'support'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            Customer Support Contact
+          </button>
         </div>
 
         {/* TAB 1: Booking List & Search */}
         {activeTab === 'bookings' && (
           <section className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
-            <div className="p-4 sm:p-6 border-b border-slate-200 flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
+            <div className="p-4 sm:p-6 border-b border-slate-200 flex flex-col lg:flex-row gap-3 lg:items-center lg:justify-between">
               <div className="relative flex-1 max-w-md">
                 <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
@@ -868,19 +1246,52 @@ export function AdminPortal() {
                 />
               </div>
 
-              <select
-                value={dateFilterId}
-                onChange={(e) => setDateFilterId(e.target.value)}
-                aria-label="Filter by travel date"
-                className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 bg-white text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0F3D5E]/25 focus:border-[#0F3D5E]"
-              >
-                <option value="all">All Travel Dates</option>
-                {travelDates.map((td) => (
-                  <option key={td.id} value={td.id}>
-                    {td.label} ({td.bookedCount}/{td.capacity})
-                  </option>
-                ))}
-              </select>
+              <div className="flex flex-wrap items-center gap-3">
+                <select
+                  value={dateFilterId}
+                  onChange={(e) => setDateFilterId(e.target.value)}
+                  aria-label="Filter by travel date"
+                  className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 bg-white text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0F3D5E]/25 focus:border-[#0F3D5E]"
+                >
+                  <option value="all">All Travel Dates</option>
+                  {travelDates.map((td) => (
+                    <option key={td.id} value={td.id}>
+                      {td.label} ({td.bookedCount}/{td.capacity})
+                    </option>
+                  ))}
+                </select>
+
+                <div
+                  role="group"
+                  aria-label="Booking list view mode"
+                  className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl border border-slate-200"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setBookingViewMode('grouped')}
+                    className={`min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                      bookingViewMode === 'grouped'
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Layers className="w-3.5 h-3.5 shrink-0" />
+                    <span>Grouped by Date</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBookingViewMode('table')}
+                    className={`min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                      bookingViewMode === 'table'
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <List className="w-3.5 h-3.5 shrink-0" />
+                    <span>All Bookings</span>
+                  </button>
+                </div>
+              </div>
             </div>
 
             {dataLoading ? (
@@ -889,6 +1300,215 @@ export function AdminPortal() {
                 <div className="h-11 bg-slate-100 rounded-lg animate-pulse" />
                 <div className="h-11 bg-slate-100 rounded-lg animate-pulse" />
               </div>
+            ) : bookingViewMode === 'grouped' ? (
+              groupedBookings.length === 0 ? (
+                <div className="p-10 text-center text-sm text-slate-500">
+                  {travelDates.length === 0 && bookings.length === 0
+                    ? 'No travel dates or bookings have been created yet.'
+                    : 'No travel dates or bookings match your search filter.'}
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-200">
+                  {groupedBookings.map((group) => {
+                    const remaining =
+                      group.capacity !== null ? Math.max(0, group.capacity - group.bookedCount) : null;
+                    const state =
+                      group.capacity !== null
+                        ? getTripCapacityState(group.capacity, group.bookedCount, group.isOpen)
+                        : null;
+                    return (
+                      <div key={group.id} className="bg-white">
+                        {/* Group Header */}
+                        <div className="px-4 sm:px-6 py-4 bg-slate-50/90 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <Calendar className="w-4 h-4 text-[#0F3D5E] shrink-0" />
+                            <div>
+                              <h3 className="font-display text-base font-bold text-slate-900">
+                                {group.label}
+                              </h3>
+                              {group.isoDate && (
+                                <p className="font-mono text-xs text-slate-500">{group.isoDate}</p>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-3 text-xs">
+                            {group.capacity !== null && (
+                              <span className="font-mono tabular-nums font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg px-2.5 py-1">
+                                {group.bookedCount} / {group.capacity} booked · {remaining} remaining
+                              </span>
+                            )}
+                            {state && (
+                              <span
+                                className={`inline-flex items-center gap-1 font-semibold ${
+                                  state === 'closed'
+                                    ? 'text-slate-600'
+                                    : state === 'sold_out'
+                                    ? 'text-rose-700'
+                                    : state === 'filling_up'
+                                    ? 'text-amber-700'
+                                    : 'text-teal-700'
+                                }`}
+                              >
+                                {state === 'closed' || state === 'sold_out' ? (
+                                  <Lock className="w-3.5 h-3.5" />
+                                ) : state === 'filling_up' ? (
+                                  <Clock className="w-3.5 h-3.5" />
+                                ) : (
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {state === 'closed'
+                                    ? 'Closed'
+                                    : state === 'sold_out'
+                                    ? 'Sold Out'
+                                    : state === 'filling_up'
+                                    ? 'Filling Up'
+                                    : 'Available'}
+                                </span>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {group.bookings.length === 0 ? (
+                          <div className="px-6 py-5 text-xs sm:text-sm text-slate-500">
+                            No bookings for this travel date yet.
+                          </div>
+                        ) : (
+                          <>
+                            {/* Desktop Grouped Table */}
+                            <div className="hidden md:block overflow-x-auto">
+                              <table className="w-full text-left border-collapse">
+                                <thead>
+                                  <tr className="border-b border-slate-200 text-xs font-semibold text-slate-500 bg-white">
+                                    <th className="py-2.5 px-5">Booking No.</th>
+                                    <th className="py-2.5 px-4">Customer Name</th>
+                                    <th className="py-2.5 px-4">Phone Number</th>
+                                    <th className="py-2.5 px-4">Status</th>
+                                    <th className="py-2.5 px-4">Booking Date &amp; Time</th>
+                                    <th className="py-2.5 px-5 text-right">Actions</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100 text-sm">
+                                  {group.bookings.map((b) => (
+                                    <tr key={b.id} className="hover:bg-slate-50/80 transition-colors">
+                                      <td className="py-3 px-5 font-mono tabular-nums font-bold text-[#0F3D5E] whitespace-nowrap">
+                                        {b.bookingNumber}
+                                      </td>
+                                      <td className="py-3 px-4 font-medium text-slate-900">
+                                        {b.customerName}
+                                      </td>
+                                      <td className="py-3 px-4 font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                                        {b.phone}
+                                      </td>
+                                      <td className="py-3 px-4 whitespace-nowrap">
+                                        <span
+                                          className={`inline-flex items-center px-2.5 py-0.5 rounded-md border text-xs font-semibold ${
+                                            b.status === 'Cancelled'
+                                              ? 'bg-rose-50 text-rose-800 border-rose-200'
+                                              : 'bg-teal-50 text-teal-800 border-teal-200'
+                                          }`}
+                                        >
+                                          {b.status}
+                                        </span>
+                                      </td>
+                                      <td className="py-3 px-4 font-mono tabular-nums text-xs text-slate-600 whitespace-nowrap">
+                                        {formatServerTimestamp(b.createdAtMs, 'en')}
+                                      </td>
+                                      <td className="py-3 px-5 text-right whitespace-nowrap">
+                                        <div className="inline-flex items-center gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => setSelectedBooking(b)}
+                                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
+                                          >
+                                            <Eye className="w-3.5 h-3.5" />
+                                            <span>View</span>
+                                          </button>
+                                          {b.status === 'Confirmed' && (
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setCancelError(null);
+                                                setBookingToCancel(b);
+                                              }}
+                                              aria-label={`Cancel booking ${b.bookingNumber} on ${b.travelDateLabel}`}
+                                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer"
+                                            >
+                                              <Ban className="w-3.5 h-3.5" />
+                                              <span>Cancel</span>
+                                            </button>
+                                          )}
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+
+                            {/* Mobile Grouped Cards */}
+                            <div className="md:hidden divide-y divide-slate-100">
+                              {group.bookings.map((b) => (
+                                <div key={b.id} className="p-4 space-y-2">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-mono tabular-nums text-base font-bold text-[#0F3D5E]">
+                                        {b.bookingNumber}
+                                      </span>
+                                      <span
+                                        className={`inline-flex items-center px-2 py-0.5 rounded-md border text-[11px] font-semibold ${
+                                          b.status === 'Cancelled'
+                                            ? 'bg-rose-50 text-rose-800 border-rose-200'
+                                            : 'bg-teal-50 text-teal-800 border-teal-200'
+                                        }`}
+                                      >
+                                        {b.status}
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => setSelectedBooking(b)}
+                                        className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800"
+                                      >
+                                        <Eye className="w-3.5 h-3.5" />
+                                        <span>Details</span>
+                                      </button>
+                                      {b.status === 'Confirmed' && (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setCancelError(null);
+                                            setBookingToCancel(b);
+                                          }}
+                                          aria-label={`Cancel booking ${b.bookingNumber} on ${b.travelDateLabel}`}
+                                          className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700"
+                                        >
+                                          <Ban className="w-3.5 h-3.5" />
+                                          <span>Cancel</span>
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <p className="font-semibold text-slate-900">{b.customerName}</p>
+                                  <div className="text-xs text-slate-600 space-y-0.5">
+                                    <p className="font-mono tabular-nums">Phone: {b.phone}</p>
+                                    <p className="font-mono tabular-nums">
+                                      Booked: {formatServerTimestamp(b.createdAtMs, 'en')}
+                                    </p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )
             ) : filteredBookings.length === 0 ? (
               <div className="p-10 text-center text-sm text-slate-500">
                 {bookings.length === 0
@@ -905,9 +1525,10 @@ export function AdminPortal() {
                         <th className="py-3 px-5">Booking No.</th>
                         <th className="py-3 px-4">Customer Name</th>
                         <th className="py-3 px-4">Phone Number</th>
-                        <th className="py-3 px-4">Assigned Travel Date</th>
+                        <th className="py-3 px-4">Travel Date</th>
+                        <th className="py-3 px-4">Status</th>
                         <th className="py-3 px-4">Booking Date &amp; Time</th>
-                        <th className="py-3 px-5 text-right">Details</th>
+                        <th className="py-3 px-5 text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-sm">
@@ -925,6 +1546,17 @@ export function AdminPortal() {
                           <td className="py-3.5 px-4 text-slate-800 whitespace-nowrap">
                             {b.travelDateLabel}
                           </td>
+                          <td className="py-3.5 px-4 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center px-2.5 py-0.5 rounded-md border text-xs font-semibold ${
+                                b.status === 'Cancelled'
+                                  ? 'bg-rose-50 text-rose-800 border-rose-200'
+                                  : 'bg-teal-50 text-teal-800 border-teal-200'
+                              }`}
+                            >
+                              {b.status}
+                            </span>
+                          </td>
                           <td className="py-3.5 px-4 font-mono tabular-nums text-xs text-slate-600 whitespace-nowrap">
                             {formatServerTimestamp(b.createdAtMs, 'en')}
                           </td>
@@ -938,18 +1570,20 @@ export function AdminPortal() {
                                 <Eye className="w-3.5 h-3.5" />
                                 <span>View</span>
                               </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setDeleteError(null);
-                                  setBookingToDelete(b);
-                                }}
-                                aria-label={`Delete booking ${b.bookingNumber}`}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                                <span>Delete</span>
-                              </button>
+                              {b.status === 'Confirmed' && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCancelError(null);
+                                    setBookingToCancel(b);
+                                  }}
+                                  aria-label={`Cancel booking ${b.bookingNumber}`}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer"
+                                >
+                                  <Ban className="w-3.5 h-3.5" />
+                                  <span>Cancel</span>
+                                </button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -963,9 +1597,20 @@ export function AdminPortal() {
                   {filteredBookings.map((b) => (
                     <div key={b.id} className="p-4 space-y-2.5">
                       <div className="flex items-center justify-between gap-3">
-                        <span className="font-mono tabular-nums text-base font-bold text-[#0F3D5E]">
-                          {b.bookingNumber}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono tabular-nums text-base font-bold text-[#0F3D5E]">
+                            {b.bookingNumber}
+                          </span>
+                          <span
+                            className={`inline-flex items-center px-2 py-0.5 rounded-md border text-[11px] font-semibold ${
+                              b.status === 'Cancelled'
+                                ? 'bg-rose-50 text-rose-800 border-rose-200'
+                                : 'bg-teal-50 text-teal-800 border-teal-200'
+                            }`}
+                          >
+                            {b.status}
+                          </span>
+                        </div>
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
@@ -975,18 +1620,20 @@ export function AdminPortal() {
                             <Eye className="w-3.5 h-3.5" />
                             <span>Details</span>
                           </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setDeleteError(null);
-                              setBookingToDelete(b);
-                            }}
-                            aria-label={`Delete booking ${b.bookingNumber}`}
-                            className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>Delete</span>
-                          </button>
+                          {b.status === 'Confirmed' && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCancelError(null);
+                                setBookingToCancel(b);
+                              }}
+                              aria-label={`Cancel booking ${b.bookingNumber}`}
+                              className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700"
+                            >
+                              <Ban className="w-3.5 h-3.5" />
+                              <span>Cancel</span>
+                            </button>
+                          )}
                         </div>
                       </div>
                       <p className="font-semibold text-slate-900">{b.customerName}</p>
@@ -1089,8 +1736,8 @@ export function AdminPortal() {
                   Configured Travel Dates &amp; Capacity
                 </h2>
                 <p className="text-xs sm:text-sm text-slate-600 mt-1">
-                  Customers are automatically assigned to the earliest open date with remaining
-                  capacity. Capacity cannot be reduced below confirmed bookings.
+                  Customers choose from open travel dates below. Each date has its own independent
+                  capacity limit and per-date booking sequence starting at BT-1.
                 </p>
               </div>
 
@@ -1182,10 +1829,168 @@ export function AdminPortal() {
             </section>
           </div>
         )}
+
+        {/* TAB 3: Customer Support Contact Settings */}
+        {activeTab === 'support' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            <section className="lg:col-span-6 bg-white border border-slate-200 rounded-2xl p-6 space-y-5">
+              <div className="space-y-1">
+                <h2 className="font-display text-lg font-bold text-slate-900">
+                  Customer Support Contact Settings
+                </h2>
+                <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
+                  Configure the Admin Phone Number and Telegram account displayed in the Contact
+                  Admin section on the customer website. Leave a field blank to hide that option.
+                </p>
+              </div>
+
+              <form onSubmit={handleSaveContactSettings} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label htmlFor="support-phone" className="block text-sm font-semibold text-slate-800">
+                    Admin Phone Number
+                  </label>
+                  <input
+                    id="support-phone"
+                    type="tel"
+                    maxLength={32}
+                    value={adminPhoneValue}
+                    onChange={(e) => {
+                      setPhoneDraft(e.target.value);
+                      setContactError(null);
+                      setContactSuccess(null);
+                    }}
+                    placeholder="e.g., 09 789 123 456 or +959789123456"
+                    className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 font-mono text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#0F3D5E]/25 focus:border-[#0F3D5E]"
+                  />
+                  {adminPhoneValue.trim() && (
+                    <p className="text-xs text-slate-500">
+                      Dialer link:{' '}
+                      <span className="font-mono text-slate-700">
+                        {normalizeTelHref(adminPhoneValue) ?? 'Invalid phone format'}
+                      </span>
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-1.5">
+                  <label
+                    htmlFor="support-telegram"
+                    className="block text-sm font-semibold text-slate-800"
+                  >
+                    Telegram Username or Link
+                  </label>
+                  <input
+                    id="support-telegram"
+                    type="text"
+                    maxLength={160}
+                    value={telegramInputValue}
+                    onChange={(e) => {
+                      setTelegramDraft(e.target.value);
+                      setContactError(null);
+                      setContactSuccess(null);
+                    }}
+                    placeholder="e.g., @merguihorizon or https://t.me/merguihorizon"
+                    className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 font-mono text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#0F3D5E]/25 focus:border-[#0F3D5E]"
+                  />
+                  {telegramInputValue.trim() && (
+                    <p className="text-xs text-slate-500">
+                      Telegram URL:{' '}
+                      <span className="font-mono text-slate-700">
+                        {normalizeTelegramLink(telegramInputValue)?.href ??
+                          'Invalid Telegram username or t.me link'}
+                      </span>
+                    </p>
+                  )}
+                </div>
+
+                {contactError && (
+                  <div
+                    role="alert"
+                    className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-900"
+                  >
+                    {contactError}
+                  </div>
+                )}
+
+                {contactSuccess && (
+                  <div className="p-3 rounded-xl bg-teal-50 border border-teal-200 text-xs text-teal-900">
+                    {contactSuccess}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={savingContact}
+                  className="w-full min-h-[44px] rounded-xl bg-[#0F3D5E] text-white text-sm font-semibold hover:bg-[#0c314c] transition-colors disabled:opacity-60 cursor-pointer"
+                >
+                  {savingContact ? 'Saving...' : 'Save Contact Details'}
+                </button>
+              </form>
+            </section>
+
+            <section className="lg:col-span-6 bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+              <div className="space-y-1">
+                <h2 className="font-display text-lg font-bold text-slate-900">
+                  Live Customer View Preview
+                </h2>
+                <p className="text-xs sm:text-sm text-slate-600">
+                  Currently published contact links shown to customers:
+                </p>
+              </div>
+
+              {!normalizeTelHref(contactSettings.adminPhone) &&
+              !normalizeTelegramLink(contactSettings.telegramInput) ? (
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-500">
+                  No customer support contact details are published yet.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {normalizeTelHref(contactSettings.adminPhone) && (
+                    <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-10 h-10 rounded-xl bg-[#0F3D5E]/10 text-[#0F3D5E] flex items-center justify-center shrink-0">
+                          <Phone className="w-4 h-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-slate-500">Call Admin</p>
+                          <p className="font-mono tabular-nums text-sm font-bold text-slate-900 truncate">
+                            {contactSettings.adminPhone}
+                          </p>
+                        </div>
+                      </div>
+                      <span className="font-mono text-xs text-slate-500 shrink-0">
+                        {normalizeTelHref(contactSettings.adminPhone)}
+                      </span>
+                    </div>
+                  )}
+
+                  {normalizeTelegramLink(contactSettings.telegramInput) && (
+                    <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-10 h-10 rounded-xl bg-teal-50 text-teal-700 flex items-center justify-center shrink-0">
+                          <Send className="w-4 h-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-slate-500">Telegram</p>
+                          <p className="font-mono text-sm font-bold text-slate-900 truncate">
+                            {normalizeTelegramLink(contactSettings.telegramInput)?.display}
+                          </p>
+                        </div>
+                      </div>
+                      <span className="font-mono text-xs text-slate-500 truncate max-w-[180px]">
+                        {normalizeTelegramLink(contactSettings.telegramInput)?.href}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
       </main>
 
       {/* Booking Details / Receipt Modal */}
-      {selectedBooking && (
+      {activeSelectedBooking && (
         <div
           role="dialog"
           aria-modal="true"
@@ -1193,17 +1998,24 @@ export function AdminPortal() {
         >
           <div className="max-w-lg w-full space-y-3 my-auto">
             <div className="flex items-center justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => {
-                  setDeleteError(null);
-                  setBookingToDelete(selectedBooking);
-                }}
-                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 text-white text-xs font-semibold hover:bg-rose-700 shadow cursor-pointer"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Delete Booking</span>
-              </button>
+              {activeSelectedBooking.status === 'Confirmed' ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCancelError(null);
+                    setBookingToCancel(activeSelectedBooking);
+                  }}
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 text-white text-xs font-semibold hover:bg-rose-700 shadow cursor-pointer"
+                >
+                  <Ban className="w-3.5 h-3.5" />
+                  <span>Cancel Booking</span>
+                </button>
+              ) : (
+                <span className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-100 text-rose-800 text-xs font-semibold border border-rose-200">
+                  <Ban className="w-3.5 h-3.5" />
+                  <span>Cancelled</span>
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => setSelectedBooking(null)}
@@ -1213,13 +2025,13 @@ export function AdminPortal() {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <BookingReceiptCard booking={selectedBooking} locale={locale} />
+            <BookingReceiptCard booking={activeSelectedBooking} locale={locale} />
           </div>
         </div>
       )}
 
-      {/* Delete Booking Confirmation Modal */}
-      {bookingToDelete && (
+      {/* Cancel Booking Confirmation Modal */}
+      {bookingToCancel && (
         <div
           role="dialog"
           aria-modal="true"
@@ -1227,54 +2039,57 @@ export function AdminPortal() {
         >
           <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 space-y-5">
             <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1">
+              <div className="space-y-1.5">
                 <h3 className="font-display text-lg font-bold text-slate-900">
-                  Delete Booking {bookingToDelete.bookingNumber}?
+                  Cancel Booking {bookingToCancel.bookingNumber}?
                 </h3>
                 <p className="text-sm text-slate-600 leading-relaxed">
-                  This will remove the booking for{' '}
+                  This will update the booking status for{' '}
                   <span className="font-semibold text-slate-900">
-                    {bookingToDelete.customerName}
+                    {bookingToCancel.customerName}
                   </span>{' '}
-                  (<span className="font-mono">{bookingToDelete.phone}</span>), release their seat on{' '}
+                  (<span className="font-mono">{bookingToCancel.phone}</span>) to{' '}
+                  <span className="font-semibold text-rose-700">Cancelled</span> and restore 1
+                  available seat on{' '}
                   <span className="font-semibold text-slate-900">
-                    {bookingToDelete.travelDateLabel}
+                    {bookingToCancel.travelDateLabel}
                   </span>
-                  , and allow that phone number to book again.
+                  . The booking record and number ({bookingToCancel.bookingNumber}) will be preserved
+                  as history.
                 </p>
               </div>
               <button
                 type="button"
-                onClick={() => setBookingToDelete(null)}
-                aria-label="Cancel delete"
+                onClick={() => setBookingToCancel(null)}
+                aria-label="Close cancellation dialog"
                 className="w-9 h-9 rounded-lg border border-slate-200 flex items-center justify-center text-slate-600 hover:bg-slate-50 shrink-0 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {deleteError && (
+            {cancelError && (
               <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-900">
-                {deleteError}
+                {cancelError}
               </div>
             )}
 
             <div className="flex items-center justify-end gap-3">
               <button
                 type="button"
-                onClick={() => setBookingToDelete(null)}
-                disabled={deletingBooking}
+                onClick={() => setBookingToCancel(null)}
+                disabled={cancellingBooking}
                 className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
               >
-                Cancel
+                Keep Booking
               </button>
               <button
                 type="button"
-                onClick={handleConfirmDeleteBooking}
-                disabled={deletingBooking}
+                onClick={handleConfirmCancelBooking}
+                disabled={cancellingBooking}
                 className="min-h-[42px] px-5 py-2 rounded-xl bg-rose-600 text-white text-sm font-semibold hover:bg-rose-700 disabled:opacity-60 cursor-pointer"
               >
-                {deletingBooking ? 'Deleting...' : 'Confirm Delete'}
+                {cancellingBooking ? 'Cancelling...' : 'Confirm Cancellation'}
               </button>
             </div>
           </div>

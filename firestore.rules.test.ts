@@ -38,12 +38,12 @@ export const DIRTY_DOZEN_PAYLOADS: DirtyPayloadCase[] = [
   },
   {
     id: 2,
-    name: 'Spoofed Booking Number Skipping Counter',
+    name: 'Spoofed Booking Number Skipping Per-Date Counter',
     collection: 'bookings',
     operation: 'create',
     payload: { bookingNumber: 'BT-999' },
     expectedOutcome: 'PERMISSION_DENIED',
-    enforcedByRule: "incoming().bookingNumber == 'BT-' + string(getAfter(counters/booking).data.lastNumber)",
+    enforcedByRule: "incoming().bookingNumber == 'BT-' + string(getAfter(dateCounters/$(travelDateId)).data.lastNumber)",
   },
   {
     id: 3,
@@ -56,11 +56,11 @@ export const DIRTY_DOZEN_PAYLOADS: DirtyPayloadCase[] = [
   },
   {
     id: 4,
-    name: 'Orphan Booking Without Counter Increment',
+    name: 'Orphan Booking Without Per-Date Counter Increment',
     collection: 'bookings',
     operation: 'create',
     expectedOutcome: 'PERMISSION_DENIED',
-    enforcedByRule: 'getAfter(counters/booking).data.lastNumber == get(counters/booking).data.lastNumber + 1',
+    enforcedByRule: 'getAfter(dateCounters/$(travelDateId)).data.lastNumber == get(dateCounters/$(travelDateId)).data.lastNumber + 1',
   },
   {
     id: 5,
@@ -82,8 +82,8 @@ export const DIRTY_DOZEN_PAYLOADS: DirtyPayloadCase[] = [
   },
   {
     id: 7,
-    name: 'Global Counter Reset Attack',
-    collection: 'counters',
+    name: 'Per-Date Counter Reset Attack',
+    collection: 'dateCounters',
     operation: 'update',
     payload: { lastNumber: 0 },
     expectedOutcome: 'PERMISSION_DENIED',

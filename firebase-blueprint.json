@@ -28,7 +28,7 @@
         },
         "isOpen": {
           "type": "boolean",
-          "description": "Whether this date is open for automatic assignment."
+          "description": "Whether this date is open for customer selection and booking."
         },
         "createdAt": {
           "type": "string",
@@ -67,9 +67,33 @@
       },
       "required": ["lastNumber", "lastBookingId", "updatedAt"]
     },
+    "DateBookingCounter": {
+      "title": "DateBookingCounter",
+      "description": "Per-travel-date monotonic sequence counter generating BT-1, BT-2, ... starting from BT-1 for each travel date.",
+      "type": "object",
+      "properties": {
+        "lastNumber": {
+          "type": "integer",
+          "description": "Highest issued sequential booking number for this travel date."
+        },
+        "lastBookingId": {
+          "type": "string",
+          "description": "Document ID of the most recently issued booking on this date or INIT.",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last counter update for this date."
+        }
+      },
+      "required": ["lastNumber", "lastBookingId", "updatedAt"]
+    },
     "PhoneLock": {
       "title": "PhoneLock",
-      "description": "Uniqueness lock keyed by SHA-256 hash of normalized phone number to prevent duplicate bookings without exposing PII.",
+      "description": "Per-travel-date uniqueness lock keyed by SHA-256(normalizedPhone + '|' + travelDateId) to enforce one active booking per phone number per travel date without exposing PII.",
       "type": "object",
       "properties": {
         "bookingId": {
@@ -103,12 +127,12 @@
     },
     "Booking": {
       "title": "Booking",
-      "description": "Confirmed customer boat trip booking record keyed by SHA-256(normalizedName + '|' + normalizedPhone).",
+      "description": "Confirmed customer boat trip booking record keyed by SHA-256(normalizedName + '|' + normalizedPhone + '|' + travelDateId).",
       "type": "object",
       "properties": {
         "bookingNumber": {
           "type": "string",
-          "description": "Global sequential booking number (BT-1, BT-2, ...).",
+          "description": "Per-travel-date sequential booking number (BT-1, BT-2, ...), restarting from BT-1 on each travel date.",
           "minLength": 4,
           "maxLength": 32,
           "pattern": "^BT-[1-9][0-9]*$"
@@ -145,22 +169,29 @@
           "maxLength": 64,
           "pattern": "^[a-f0-9]{64}$"
         },
+        "datePhoneHash": {
+          "type": "string",
+          "description": "SHA-256 hex digest of normalizedPhone + '|' + travelDateId for per-date uniqueness lock.",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
         "travelDateId": {
           "type": "string",
-          "description": "Assigned travelDates document ID.",
+          "description": "Customer-selected travelDates document ID.",
           "minLength": 3,
           "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "travelDateLabel": {
           "type": "string",
-          "description": "Human-readable assigned travel date.",
+          "description": "Human-readable selected travel date.",
           "minLength": 3,
           "maxLength": 64
         },
         "status": {
           "type": "string",
-          "enum": ["Confirmed"],
+          "enum": ["Confirmed", "Cancelled"],
           "description": "Booking confirmation status."
         },
         "tripName": {
@@ -173,6 +204,11 @@
           "type": "string",
           "format": "date-time",
           "description": "Server-generated booking timestamp."
+        },
+        "cancelledAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server-generated timestamp when cancelled by Admin."
         }
       },
       "required": [
@@ -212,6 +248,31 @@
         }
       },
       "required": ["email", "role", "createdAt"]
+    },
+    "ContactSettings": {
+      "title": "ContactSettings",
+      "description": "Admin-configured customer support contact details (phone and Telegram).",
+      "type": "object",
+      "properties": {
+        "adminPhone": {
+          "type": "string",
+          "description": "Admin support phone number for tel: links.",
+          "minLength": 0,
+          "maxLength": 32
+        },
+        "telegramInput": {
+          "type": "string",
+          "description": "Admin Telegram username or https://t.me/ link.",
+          "minLength": 0,
+          "maxLength": 160
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when contact settings were last updated."
+        }
+      },
+      "required": ["adminPhone", "telegramInput", "updatedAt"]
     }
   },
   "firestore": {
@@ -221,19 +282,27 @@
     },
     "/counters/{counterId}": {
       "schema": { "$ref": "#/entities/BookingCounter" },
-      "description": "Global sequential booking number counter (document ID: booking)."
+      "description": "Legacy global booking sequence counter."
+    },
+    "/dateCounters/{dateId}": {
+      "schema": { "$ref": "#/entities/DateBookingCounter" },
+      "description": "Per-travel-date sequential booking number counter restarting from BT-1 for each date."
     },
     "/phoneLocks/{phoneHash}": {
       "schema": { "$ref": "#/entities/PhoneLock" },
-      "description": "Per-phone uniqueness locks preventing duplicate bookings across customers."
+      "description": "Per-date phone uniqueness locks (SHA-256(normalizedPhone + '|' + travelDateId)) preventing duplicate bookings on the same date."
     },
     "/bookings/{bookingId}": {
       "schema": { "$ref": "#/entities/Booking" },
-      "description": "Confirmed customer bookings keyed by SHA-256(normalizedName + '|' + normalizedPhone)."
+      "description": "Customer bookings keyed by SHA-256(normalizedName + '|' + normalizedPhone + '|' + travelDateId)."
     },
     "/admins/{uid}": {
       "schema": { "$ref": "#/entities/AdminUser" },
       "description": "Authorized Firebase Admin UIDs."
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/ContactSettings" },
+      "description": "Public customer support configuration document (contact)."
     }
   }
 }

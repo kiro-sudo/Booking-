@@ -8,16 +8,21 @@ import {
   CheckCircle2,
   Clock,
   Lock,
+  Phone,
   Search,
+  Send,
   Ship,
   Users,
 } from 'lucide-react';
-import { collection, onSnapshot, orderBy, query } from 'firebase/firestore';
+import { collection, doc, onSnapshot, orderBy, query, Timestamp } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '@/lib/firebase';
 import {
   BookingRecord,
+  ContactSettingsRecord,
   createAtomicBooking,
   lookupCustomerBooking,
+  normalizeTelegramLink,
+  normalizeTelHref,
   TravelDateRecord,
 } from '@/lib/booking-helpers';
 import { COPY, getTripCapacityState, Locale, TRIP_INFO, TripCapacityState } from '@/lib/i18n';
@@ -69,6 +74,7 @@ export function CustomerBookingPortal() {
   const [scheduleLoading, setScheduleLoading] = useState(true);
 
   // Booking form state
+  const [userSelectedDateId, setUserSelectedDateId] = useState<string | null>(null);
   const [customerName, setCustomerName] = useState('');
   const [phone, setPhone] = useState('');
   const [bookingSubmitting, setBookingSubmitting] = useState(false);
@@ -83,11 +89,15 @@ export function CustomerBookingPortal() {
   const [lookupPhone, setLookupPhone] = useState('');
   const [lookupSubmitting, setLookupSubmitting] = useState(false);
   const [lookupError, setLookupError] = useState<string | null>(null);
-  const [lookupResult, setLookupResult] = useState<BookingRecord | null>(null);
+  const [lookupResults, setLookupResults] = useState<BookingRecord[]>([]);
 
   // Image fallback state
   const [heroImgFailed, setHeroImgFailed] = useState(false);
   const [deckImgFailed, setDeckImgFailed] = useState(false);
+
+  // Customer support contact settings (from Firestore /settings/contact)
+  const [contactSettings, setContactSettings] = useState<ContactSettingsRecord | null>(null);
+  const [contactLoading, setContactLoading] = useState(true);
 
   const t = COPY[locale];
   const trip = TRIP_INFO[locale];
@@ -121,6 +131,39 @@ export function CustomerBookingPortal() {
     return () => unsub();
   }, []);
 
+  useEffect(() => {
+    const contactRef = doc(db, 'settings', 'contact');
+    const unsub = onSnapshot(
+      contactRef,
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() as Record<string, unknown>;
+          setContactSettings({
+            adminPhone: String(data.adminPhone ?? ''),
+            telegramInput: String(data.telegramInput ?? ''),
+            updatedAtMs: data.updatedAt instanceof Timestamp ? data.updatedAt.toMillis() : 0,
+          });
+        } else {
+          setContactSettings(null);
+        }
+        setContactLoading(false);
+      },
+      (error) => {
+        setContactLoading(false);
+        handleFirestoreError(error, OperationType.GET, 'settings/contact');
+      }
+    );
+    return () => unsub();
+  }, []);
+
+  const contactTelHref = contactSettings?.adminPhone
+    ? normalizeTelHref(contactSettings.adminPhone)
+    : null;
+
+  const contactTelegram = contactSettings?.telegramInput
+    ? normalizeTelegramLink(contactSettings.telegramInput)
+    : null;
+
   const scheduleSummary = useMemo(() => {
     const openAvailable = travelDates.filter((d) => d.isOpen && d.bookedCount < d.capacity);
     const earliest = openAvailable[0] ?? null;
@@ -135,15 +178,38 @@ export function CustomerBookingPortal() {
     };
   }, [travelDates]);
 
+  const selectedDateRecord = useMemo(() => {
+    if (userSelectedDateId) {
+      const match = travelDates.find((d) => d.id === userSelectedDateId);
+      if (match) return match;
+    }
+    return scheduleSummary.earliest;
+  }, [userSelectedDateId, travelDates, scheduleSummary.earliest]);
+
+  const selectedDateId = selectedDateRecord?.id ?? '';
+
   const handleBookingSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (bookingSubmitting) return;
+
+    if (!selectedDateRecord || !selectedDateId) {
+      setBookingError(t.selectDateRequiredError);
+      return;
+    }
+    if (!selectedDateRecord.isOpen) {
+      setBookingError(t.selectedDateUnavailableError);
+      return;
+    }
+    if (selectedDateRecord.bookedCount >= selectedDateRecord.capacity) {
+      setBookingError(t.selectedDateFullError);
+      return;
+    }
 
     setBookingSubmitting(true);
     setBookingError(null);
 
     try {
-      const res = await createAtomicBooking(customerName, phone);
+      const res = await createAtomicBooking(customerName, phone, selectedDateId);
       if (res.status === 'created') {
         setBookingResult({ booking: res.booking, notice: t.newBookingSuccess });
         setCustomerName('');
@@ -153,12 +219,15 @@ export function CustomerBookingPortal() {
       } else if (res.status === 'phone_conflict') {
         setBookingResult(null);
         setBookingError(t.phoneConflictError);
-      } else if (res.status === 'no_capacity') {
+      } else if (res.status === 'date_full') {
         setBookingResult(null);
-        setBookingError(t.noCapacityError);
-      } else if (res.status === 'not_initialized') {
+        setBookingError(t.selectedDateFullError);
+      } else if (res.status === 'date_unavailable') {
         setBookingResult(null);
-        setBookingError(t.notInitializedError);
+        setBookingError(t.selectedDateUnavailableError);
+      } else if (res.status === 'no_date_selected') {
+        setBookingResult(null);
+        setBookingError(t.selectDateRequiredError);
       } else if (res.status === 'invalid_input') {
         setBookingError(t.invalidInputError);
       }
@@ -179,15 +248,15 @@ export function CustomerBookingPortal() {
     try {
       const res = await lookupCustomerBooking(lookupName, lookupPhone);
       if (res.status === 'found') {
-        setLookupResult(res.booking);
+        setLookupResults(res.bookings);
       } else if (res.status === 'not_found') {
-        setLookupResult(null);
+        setLookupResults([]);
         setLookupError(t.lookupNotFound);
       } else if (res.status === 'rate_limited') {
-        setLookupResult(null);
+        setLookupResults([]);
         setLookupError(`${t.lookupRateLimit} (${res.retryAfterSec}s)`);
       } else if (res.status === 'invalid_input') {
-        setLookupResult(null);
+        setLookupResults([]);
         setLookupError(t.invalidInputError);
       }
     } catch {
@@ -227,6 +296,12 @@ export function CustomerBookingPortal() {
               className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >
               {t.navFind}
+            </a>
+            <a
+              href="#contact-admin"
+              className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+            >
+              {t.navContact}
             </a>
             <Link
               href="/admin"
@@ -354,19 +429,19 @@ export function CustomerBookingPortal() {
                 <p className="font-mono tabular-nums text-lg font-bold text-[#0F3D5E]">
                   {scheduleLoading
                     ? '...'
-                    : scheduleSummary.earliest
-                    ? `${scheduleSummary.earliest.capacity - scheduleSummary.earliest.bookedCount} ${t.seatsUnit}`
-                    : `0 ${t.seatsUnit}`}
+                    : `${scheduleSummary.totalRemaining} ${t.seatsUnit}`}
                 </p>
                 {!scheduleLoading && (
                   <CapacityStatusLabel
                     state={
-                      scheduleSummary.earliest
-                        ? getTripCapacityState(
-                            scheduleSummary.earliest.capacity,
-                            scheduleSummary.earliest.bookedCount,
-                            scheduleSummary.earliest.isOpen
-                          )
+                      scheduleSummary.openCount > 0
+                        ? scheduleSummary.earliest
+                          ? getTripCapacityState(
+                              scheduleSummary.earliest.capacity,
+                              scheduleSummary.earliest.bookedCount,
+                              scheduleSummary.earliest.isOpen
+                            )
+                          : 'available'
                         : 'sold_out'
                     }
                     locale={locale}
@@ -402,20 +477,20 @@ export function CustomerBookingPortal() {
                   <p className="text-sm text-slate-600 leading-relaxed">{t.bookSectionSub}</p>
                 </div>
 
-                {/* Live Capacity Status Banner for Current Assignable Trip */}
+                {/* Live Capacity Status Banner for Selected Travel Date */}
                 {!scheduleLoading && (
                   <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-2">
                     <div className="text-xs text-slate-600 space-y-0.5">
                       <p className="font-medium text-slate-500">
-                        {scheduleSummary.earliest ? t.nextTripLabel : t.currentTripStatus}
+                        {selectedDateRecord ? t.selectedTripLabel : t.currentTripStatus}
                       </p>
                       <p className="font-semibold text-sm text-slate-900 tabular-nums">
-                        {scheduleSummary.earliest ? (
+                        {selectedDateRecord ? (
                           <>
-                            {scheduleSummary.earliest.label}
+                            {selectedDateRecord.label}
                             <span className="mx-1.5 text-slate-400" aria-hidden="true">·</span>
                             <span className="font-mono">
-                              {scheduleSummary.earliest.capacity - scheduleSummary.earliest.bookedCount}/{scheduleSummary.earliest.capacity} {t.seatsUnit}
+                              {Math.max(0, selectedDateRecord.capacity - selectedDateRecord.bookedCount)}/{selectedDateRecord.capacity} {t.seatsUnit}
                             </span>
                           </>
                         ) : (
@@ -425,11 +500,11 @@ export function CustomerBookingPortal() {
                     </div>
                     <CapacityStatusLabel
                       state={
-                        scheduleSummary.earliest
+                        selectedDateRecord
                           ? getTripCapacityState(
-                              scheduleSummary.earliest.capacity,
-                              scheduleSummary.earliest.bookedCount,
-                              scheduleSummary.earliest.isOpen
+                              selectedDateRecord.capacity,
+                              selectedDateRecord.bookedCount,
+                              selectedDateRecord.isOpen
                             )
                           : 'sold_out'
                       }
@@ -439,6 +514,77 @@ export function CustomerBookingPortal() {
                 )}
 
                 <form onSubmit={handleBookingSubmit} className="space-y-5">
+                  {/* Customer Travel Date Selection (Admin-configured dates only) */}
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="block text-sm font-semibold text-slate-800">
+                        {t.selectDateLabel}
+                      </label>
+                    </div>
+
+                    {scheduleLoading ? (
+                      <div className="space-y-2">
+                        <div className="h-14 bg-slate-100 rounded-xl animate-pulse" />
+                        <div className="h-14 bg-slate-100 rounded-xl animate-pulse" />
+                      </div>
+                    ) : travelDates.length === 0 ? (
+                      <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-600">
+                        {t.noSelectableDates}
+                      </div>
+                    ) : (
+                      <div
+                        role="radiogroup"
+                        aria-label={t.selectDateLabel}
+                        className="space-y-2 max-h-64 overflow-y-auto pr-0.5"
+                      >
+                        {travelDates.map((td) => {
+                          const remaining = Math.max(0, td.capacity - td.bookedCount);
+                          const state = getTripCapacityState(td.capacity, td.bookedCount, td.isOpen);
+                          const isBookable = td.isOpen && remaining > 0;
+                          const isSelected = selectedDateId === td.id;
+                          return (
+                            <label
+                              key={td.id}
+                              className={`min-h-[52px] flex items-center justify-between gap-3 px-4 py-3 rounded-xl border transition-all ${
+                                !isBookable
+                                  ? 'border-slate-200 bg-slate-50/80 opacity-65 cursor-not-allowed'
+                                  : isSelected
+                                  ? 'border-[#0F3D5E] bg-[#0F3D5E]/[0.04] ring-2 ring-[#0F3D5E]/20 cursor-pointer'
+                                  : 'border-slate-300 bg-white hover:border-slate-400 cursor-pointer'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 min-w-0">
+                                <input
+                                  type="radio"
+                                  name="travelDateId"
+                                  value={td.id}
+                                  checked={isSelected}
+                                  disabled={!isBookable}
+                                  onChange={() => {
+                                    setUserSelectedDateId(td.id);
+                                    setBookingError(null);
+                                  }}
+                                  className="w-4 h-4 text-[#0F3D5E] border-slate-300 focus:ring-[#0F3D5E] shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <p className="text-sm font-semibold text-slate-900 truncate">
+                                    {td.label}
+                                  </p>
+                                  <p className="font-mono tabular-nums text-xs text-slate-600">
+                                    {remaining} / {td.capacity} {t.seatsUnit} {t.seatsLeftLabel}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="shrink-0">
+                                <CapacityStatusLabel state={state} locale={locale} />
+                              </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
                   <div className="space-y-2">
                     <label
                       htmlFor="booking-name"
@@ -493,8 +639,8 @@ export function CustomerBookingPortal() {
 
                   <button
                     type="submit"
-                    disabled={bookingSubmitting}
-                    className="w-full min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-[#0F3D5E] text-white text-base font-semibold hover:bg-[#0c314c] active:scale-[0.99] transition-all disabled:opacity-60 cursor-pointer whitespace-nowrap"
+                    disabled={bookingSubmitting || scheduleSummary.openCount === 0}
+                    className="w-full min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-[#0F3D5E] text-white text-base font-semibold hover:bg-[#0c314c] active:scale-[0.99] transition-all disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
                   >
                     <CheckCircle2 className="w-5 h-5 shrink-0" />
                     <span>{bookingSubmitting ? t.submittingBooking : t.confirmBooking}</span>
@@ -586,8 +732,14 @@ export function CustomerBookingPortal() {
                 </form>
               </div>
 
-              {/* Retrieved Read-Only Original Receipt */}
-              {lookupResult && <BookingReceiptCard booking={lookupResult} locale={locale} />}
+              {/* Retrieved Read-Only Original Receipts */}
+              {lookupResults.length > 0 && (
+                <div className="space-y-4">
+                  {lookupResults.map((booking) => (
+                    <BookingReceiptCard key={booking.id} booking={booking} locale={locale} />
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </section>
@@ -700,6 +852,80 @@ export function CustomerBookingPortal() {
             </div>
           </div>
         </section>
+
+        {/* Customer Support – Contact Admin */}
+        <section
+          id="contact-admin"
+          className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-10 sm:pb-12 scroll-mt-20"
+        >
+          <div className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 space-y-6">
+            <div className="space-y-1.5">
+              <h2 className="font-display text-xl sm:text-2xl font-bold text-slate-900">
+                {t.contactTitle}
+              </h2>
+              <p className="text-sm text-slate-600 leading-relaxed max-w-2xl">{t.contactSub}</p>
+            </div>
+
+            {contactLoading ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="h-20 bg-slate-100 rounded-xl animate-pulse" />
+                <div className="h-20 bg-slate-100 rounded-xl animate-pulse" />
+              </div>
+            ) : !contactTelHref && !contactTelegram ? (
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-600">
+                {t.contactNotConfigured}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {contactTelHref && contactSettings?.adminPhone && (
+                  <a
+                    href={contactTelHref}
+                    className="min-h-[76px] flex items-center justify-between gap-4 p-4 sm:p-5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-slate-100/80 hover:border-[#0F3D5E]/40 transition-colors group"
+                  >
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      <div className="w-11 h-11 rounded-xl bg-[#0F3D5E]/10 text-[#0F3D5E] flex items-center justify-center shrink-0">
+                        <Phone className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-slate-500">{t.callAdminLabel}</p>
+                        <p className="mt-0.5 font-mono tabular-nums text-base font-bold text-slate-900 truncate">
+                          {contactSettings.adminPhone}
+                        </p>
+                      </div>
+                    </div>
+                    <span className="min-h-[40px] inline-flex items-center justify-center px-4 py-2 rounded-lg bg-[#0F3D5E] text-white text-xs sm:text-sm font-semibold group-hover:bg-[#0c314c] transition-colors whitespace-nowrap shrink-0">
+                      {t.callAdminLabel}
+                    </span>
+                  </a>
+                )}
+
+                {contactTelegram && (
+                  <a
+                    href={contactTelegram.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="min-h-[76px] flex items-center justify-between gap-4 p-4 sm:p-5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-slate-100/80 hover:border-teal-600/40 transition-colors group"
+                  >
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      <div className="w-11 h-11 rounded-xl bg-teal-50 text-teal-700 flex items-center justify-center shrink-0">
+                        <Send className="w-5 h-5" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-slate-500">{t.telegramLabel}</p>
+                        <p className="mt-0.5 font-mono text-base font-bold text-slate-900 truncate">
+                          {contactTelegram.display}
+                        </p>
+                      </div>
+                    </div>
+                    <span className="min-h-[40px] inline-flex items-center justify-center px-4 py-2 rounded-lg bg-teal-700 text-white text-xs sm:text-sm font-semibold group-hover:bg-teal-800 transition-colors whitespace-nowrap shrink-0">
+                      {t.telegramAction}
+                    </span>
+                  </a>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
       </main>
 
       {/* Quiet Footer */}
@@ -710,13 +936,16 @@ export function CustomerBookingPortal() {
             <p className="text-xs text-slate-500">{trip.pier}</p>
           </div>
           <div className="flex items-center gap-6 text-xs font-medium">
-            <a href="#book-trip" className="hover:text-slate-900 transition-colors">
+            <a href="#book-trip" className="hover:text-slate-900 transition-colors whitespace-nowrap">
               {t.navBook}
             </a>
-            <a href="#find-booking" className="hover:text-slate-900 transition-colors">
+            <a href="#find-booking" className="hover:text-slate-900 transition-colors whitespace-nowrap">
               {t.navFind}
             </a>
-            <Link href="/admin" className="hover:text-slate-900 transition-colors">
+            <a href="#contact-admin" className="hover:text-slate-900 transition-colors whitespace-nowrap">
+              {t.navContact}
+            </a>
+            <Link href="/admin" className="hover:text-slate-900 transition-colors whitespace-nowrap">
               {t.navAdmin}
             </Link>
           </div>

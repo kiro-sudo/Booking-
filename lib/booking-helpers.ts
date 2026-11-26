@@ -1,7 +1,6 @@
 import {
   collection,
   doc,
-  getDoc,
   getDocFromServer,
   getDocs,
   orderBy,
@@ -28,6 +27,8 @@ export interface TravelDateRecord {
   updatedAtMs: number;
 }
 
+export type BookingStatus = 'Confirmed' | 'Cancelled';
+
 export interface BookingRecord {
   id: string;
   bookingNumber: string;
@@ -36,11 +37,19 @@ export interface BookingRecord {
   phone: string;
   normalizedPhone: string;
   phoneHash: string;
+  datePhoneHash?: string;
   travelDateId: string;
   travelDateLabel: string;
-  status: 'Confirmed';
+  status: BookingStatus;
   tripName: string;
   createdAtMs: number;
+  cancelledAtMs?: number;
+}
+
+export interface ContactSettingsRecord {
+  adminPhone: string;
+  telegramInput: string;
+  updatedAtMs: number;
 }
 
 export function normalizeName(name: string): string {
@@ -107,6 +116,8 @@ function mapTravelDate(id: string, data: Record<string, unknown>): TravelDateRec
 
 function mapBooking(id: string, data: Record<string, unknown>): BookingRecord {
   const createdAt = data.createdAt instanceof Timestamp ? data.createdAt.toMillis() : Date.now();
+  const cancelledAtMs =
+    data.cancelledAt instanceof Timestamp ? data.cancelledAt.toMillis() : undefined;
   return {
     id,
     bookingNumber: String(data.bookingNumber ?? ''),
@@ -115,11 +126,43 @@ function mapBooking(id: string, data: Record<string, unknown>): BookingRecord {
     phone: String(data.phone ?? ''),
     normalizedPhone: String(data.normalizedPhone ?? ''),
     phoneHash: String(data.phoneHash ?? ''),
+    datePhoneHash: typeof data.datePhoneHash === 'string' ? data.datePhoneHash : undefined,
     travelDateId: String(data.travelDateId ?? ''),
     travelDateLabel: String(data.travelDateLabel ?? ''),
-    status: 'Confirmed',
+    status: data.status === 'Cancelled' ? 'Cancelled' : 'Confirmed',
     tripName: String(data.tripName ?? TRIP_INFO.en.name),
     createdAtMs: createdAt,
+    cancelledAtMs,
+  };
+}
+
+export function normalizeTelHref(phone: string): string | null {
+  const trimmed = phone.trim();
+  if (!trimmed) return null;
+  const cleaned = trimmed.replace(/[\s\-().]/g, '');
+  if (!/^[+]?[0-9]{6,24}$/.test(cleaned)) return null;
+  return `tel:${cleaned}`;
+}
+
+export function normalizeTelegramLink(input: string): { href: string; display: string } | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  let path = trimmed;
+  if (/^https?:\/\/(t\.me|telegram\.me)\//i.test(trimmed)) {
+    path = trimmed.replace(/^https?:\/\/(t\.me|telegram\.me)\//i, '').replace(/\/+$/, '');
+  } else if (/^(t\.me|telegram\.me)\//i.test(trimmed)) {
+    path = trimmed.replace(/^(t\.me|telegram\.me)\//i, '').replace(/\/+$/, '');
+  } else {
+    if (trimmed.includes('/') || trimmed.includes(':')) return null;
+    path = trimmed.replace(/^@+/, '');
+  }
+
+  if (!/^[a-zA-Z0-9_+/]{3,64}$/.test(path)) return null;
+  const display = path.startsWith('+') ? 'Telegram' : `@${path.split('/')[0]}`;
+  return {
+    href: `https://t.me/${path}`,
+    display,
   };
 }
 
@@ -133,18 +176,30 @@ export async function fetchTravelDates(): Promise<TravelDateRecord[]> {
   }
 }
 
+export function parseBookingSequence(bookingNumber: string): number {
+  const match = /^BT-([1-9][0-9]*)$/.exec(bookingNumber.trim());
+  return match ? Number(match[1]) : 0;
+}
+
 export type CreateBookingResult =
   | { status: 'created'; booking: BookingRecord }
   | { status: 'existing'; booking: BookingRecord }
   | { status: 'phone_conflict' }
-  | { status: 'no_capacity' }
-  | { status: 'not_initialized' }
+  | { status: 'date_full' }
+  | { status: 'date_unavailable' }
+  | { status: 'no_date_selected' }
   | { status: 'invalid_input' };
 
 export async function createAtomicBooking(
   customerName: string,
-  phone: string
+  phone: string,
+  selectedTravelDateId: string
 ): Promise<CreateBookingResult> {
+  const cleanDateId = selectedTravelDateId.trim();
+  if (!/^[a-zA-Z0-9_-]{3,64}$/.test(cleanDateId)) {
+    return { status: 'no_date_selected' };
+  }
+
   const check = validateBookingInputs(customerName, phone);
   if (!check.valid) {
     return { status: 'invalid_input' };
@@ -152,14 +207,17 @@ export async function createAtomicBooking(
 
   const { cleanName, normalizedName, cleanPhone, normalizedPhone } = check;
   const phoneHash = await sha256Hex(normalizedPhone);
+  const datePhoneHash = await sha256Hex(`${normalizedPhone}|${cleanDateId}`);
   const nameHash = await sha256Hex(normalizedName);
-  const bookingId = await sha256Hex(`${normalizedName}|${normalizedPhone}`);
+  const bookingId = await sha256Hex(`${normalizedName}|${normalizedPhone}|${cleanDateId}`);
 
-  const phoneLockRef = doc(db, 'phoneLocks', phoneHash);
+  const phoneLockRef = doc(db, 'phoneLocks', datePhoneHash);
+  const legacyPhoneLockRef = doc(db, 'phoneLocks', phoneHash);
   const bookingRef = doc(db, 'bookings', bookingId);
-  const counterRef = doc(db, 'counters', 'booking');
+  const dateRef = doc(db, 'travelDates', cleanDateId);
+  const dateCounterRef = doc(db, 'dateCounters', cleanDateId);
 
-  // Pre-check existing phone lock to avoid unnecessary transactions on repeat clicks
+  // Pre-check existing per-date lock (and legacy lock if on the same date)
   try {
     const lockSnap = await getDocFromServer(phoneLockRef);
     if (lockSnap.exists()) {
@@ -175,116 +233,147 @@ export async function createAtomicBooking(
       }
       return { status: 'phone_conflict' };
     }
+
+    const legacyLockSnap = await getDocFromServer(legacyPhoneLockRef);
+    if (legacyLockSnap.exists()) {
+      const legacyLockData = legacyLockSnap.data() as { bookingId: string; nameHash: string };
+      const legacyBookingRef = doc(db, 'bookings', legacyLockData.bookingId);
+      const legacyBookingSnap = await getDocFromServer(legacyBookingRef);
+      if (legacyBookingSnap.exists()) {
+        const legacyBooking = mapBooking(
+          legacyBookingSnap.id,
+          legacyBookingSnap.data() as Record<string, unknown>
+        );
+        if (legacyBooking.travelDateId === cleanDateId) {
+          if (legacyLockData.nameHash === nameHash) {
+            return { status: 'existing', booking: legacyBooking };
+          }
+          return { status: 'phone_conflict' };
+        }
+      }
+    }
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `phoneLocks/${phoneHash}`);
+    handleFirestoreError(error, OperationType.GET, `phoneLocks/${datePhoneHash}`);
   }
 
-  // Retry loop handles simultaneous requests that fill the earliest open date
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const allDates = await fetchTravelDates();
-    const openCandidates = allDates.filter((d) => d.isOpen && d.bookedCount < d.capacity);
-
-    if (openCandidates.length === 0) {
-      return { status: 'no_capacity' };
-    }
-
-    const candidate = openCandidates[0];
-    const dateRef = doc(db, 'travelDates', candidate.id);
-
-    try {
-      const txOutcome = await runTransaction(db, async (tx) => {
-        const lockSnap = await tx.get(phoneLockRef);
-        if (lockSnap.exists()) {
-          const lockData = lockSnap.data() as { nameHash: string };
-          if (lockData.nameHash === nameHash) {
-            const existingSnap = await tx.get(bookingRef);
-            if (existingSnap.exists()) {
-              return { kind: 'existing' as const };
-            }
+  try {
+    const txOutcome = await runTransaction(db, async (tx) => {
+      const lockSnap = await tx.get(phoneLockRef);
+      if (lockSnap.exists()) {
+        const lockData = lockSnap.data() as { nameHash: string };
+        if (lockData.nameHash === nameHash) {
+          const existingSnap = await tx.get(bookingRef);
+          if (existingSnap.exists()) {
+            return { kind: 'existing' as const, existingId: bookingId };
           }
-          throw new Error('__PHONE_CONFLICT__');
         }
+        throw new Error('__PHONE_CONFLICT__');
+      }
 
-        const counterSnap = await tx.get(counterRef);
-        if (!counterSnap.exists()) {
-          throw new Error('__NOT_INITIALIZED__');
+      const legacyLockSnap = await tx.get(legacyPhoneLockRef);
+      if (legacyLockSnap.exists()) {
+        const legacyLockData = legacyLockSnap.data() as { bookingId: string; nameHash: string };
+        const legacyBookingSnap = await tx.get(doc(db, 'bookings', legacyLockData.bookingId));
+        if (legacyBookingSnap.exists()) {
+          const legacyData = legacyBookingSnap.data() as { travelDateId?: string };
+          if (legacyData.travelDateId === cleanDateId) {
+            if (legacyLockData.nameHash === nameHash) {
+              return { kind: 'existing' as const, existingId: legacyBookingSnap.id };
+            }
+            throw new Error('__PHONE_CONFLICT__');
+          }
         }
+      }
 
-        const dateSnap = await tx.get(dateRef);
-        if (!dateSnap.exists()) {
-          throw new Error('__DATE_FULL_RETRY__');
-        }
-        const dateData = dateSnap.data() as {
-          isOpen: boolean;
-          bookedCount: number;
-          capacity: number;
-          label: string;
-        };
-        if (!dateData.isOpen || dateData.bookedCount >= dateData.capacity) {
-          throw new Error('__DATE_FULL_RETRY__');
-        }
+      const dateSnap = await tx.get(dateRef);
+      if (!dateSnap.exists()) {
+        throw new Error('__DATE_UNAVAILABLE__');
+      }
+      const dateData = dateSnap.data() as {
+        isOpen: boolean;
+        bookedCount: number;
+        capacity: number;
+        label: string;
+      };
+      if (!dateData.isOpen) {
+        throw new Error('__DATE_UNAVAILABLE__');
+      }
+      if (dateData.bookedCount >= dateData.capacity) {
+        throw new Error('__DATE_FULL__');
+      }
 
-        const currentNumber = Number((counterSnap.data() as { lastNumber: number }).lastNumber ?? 0);
-        const nextNumber = currentNumber + 1;
-        const bookingNumber = `BT-${nextNumber}`;
+      const dateCounterSnap = await tx.get(dateCounterRef);
+      const currentNumber = dateCounterSnap.exists()
+        ? Number((dateCounterSnap.data() as { lastNumber: number }).lastNumber ?? 0)
+        : 0;
+      const nextNumber = currentNumber + 1;
+      const bookingNumber = `BT-${nextNumber}`;
 
-        tx.update(counterRef, {
+      if (dateCounterSnap.exists()) {
+        tx.update(dateCounterRef, {
           lastNumber: nextNumber,
           lastBookingId: bookingId,
           updatedAt: serverTimestamp(),
         });
-
-        tx.update(dateRef, {
-          bookedCount: dateData.bookedCount + 1,
+      } else {
+        tx.set(dateCounterRef, {
+          lastNumber: nextNumber,
+          lastBookingId: bookingId,
           updatedAt: serverTimestamp(),
         });
+      }
 
-        tx.set(phoneLockRef, {
-          bookingId,
-          bookingNumber,
-          nameHash,
-          createdAt: serverTimestamp(),
-        });
-
-        tx.set(bookingRef, {
-          bookingNumber,
-          customerName: cleanName,
-          normalizedName,
-          phone: cleanPhone,
-          normalizedPhone,
-          phoneHash,
-          travelDateId: candidate.id,
-          travelDateLabel: dateData.label,
-          status: 'Confirmed',
-          tripName: TRIP_INFO.en.name,
-          createdAt: serverTimestamp(),
-        });
-
-        return { kind: 'created' as const };
+      tx.update(dateRef, {
+        bookedCount: dateData.bookedCount + 1,
+        updatedAt: serverTimestamp(),
       });
 
-      const finalSnap = await getDocFromServer(bookingRef);
-      if (finalSnap.exists()) {
-        return {
-          status: txOutcome.kind,
-          booking: mapBooking(finalSnap.id, finalSnap.data() as Record<string, unknown>),
-        };
-      }
-    } catch (error) {
-      if (error instanceof Error) {
-        if (error.message === '__PHONE_CONFLICT__') return { status: 'phone_conflict' };
-        if (error.message === '__NOT_INITIALIZED__') return { status: 'not_initialized' };
-        if (error.message === '__DATE_FULL_RETRY__') continue;
-      }
-      handleFirestoreError(error, OperationType.WRITE, `bookings/${bookingId}`);
-    }
-  }
+      tx.set(phoneLockRef, {
+        bookingId,
+        bookingNumber,
+        nameHash,
+        createdAt: serverTimestamp(),
+      });
 
-  return { status: 'no_capacity' };
+      tx.set(bookingRef, {
+        bookingNumber,
+        customerName: cleanName,
+        normalizedName,
+        phone: cleanPhone,
+        normalizedPhone,
+        phoneHash,
+        datePhoneHash,
+        travelDateId: cleanDateId,
+        travelDateLabel: dateData.label,
+        status: 'Confirmed',
+        tripName: TRIP_INFO.en.name,
+        createdAt: serverTimestamp(),
+      });
+
+      return { kind: 'created' as const, existingId: bookingId };
+    });
+
+    const targetRef = doc(db, 'bookings', txOutcome.existingId);
+    const finalSnap = await getDocFromServer(targetRef);
+    if (finalSnap.exists()) {
+      return {
+        status: txOutcome.kind,
+        booking: mapBooking(finalSnap.id, finalSnap.data() as Record<string, unknown>),
+      };
+    }
+    return { status: 'date_unavailable' };
+  } catch (error) {
+    if (error instanceof Error) {
+      if (error.message === '__PHONE_CONFLICT__') return { status: 'phone_conflict' };
+      if (error.message === '__DATE_UNAVAILABLE__') return { status: 'date_unavailable' };
+      if (error.message === '__DATE_FULL__') return { status: 'date_full' };
+    }
+    handleFirestoreError(error, OperationType.WRITE, `bookings/${bookingId}`);
+  }
 }
 
 export type LookupBookingResult =
-  | { status: 'found'; booking: BookingRecord }
+  | { status: 'found'; bookings: BookingRecord[] }
   | { status: 'not_found' }
   | { status: 'rate_limited'; retryAfterSec: number }
   | { status: 'invalid_input' };
@@ -308,40 +397,49 @@ export async function lookupCustomerBooking(
     return { status: 'rate_limited', retryAfterSec: body.retryAfterSec ?? 120 };
   }
 
-  const bookingId = await sha256Hex(`${check.normalizedName}|${check.normalizedPhone}`);
+  const dates = await fetchTravelDates();
+  const dateOrderMap = new Map<string, string>(dates.map((d) => [d.id, d.date]));
+
+  const candidateIds = await Promise.all([
+    sha256Hex(`${check.normalizedName}|${check.normalizedPhone}`),
+    ...dates.map((d) => sha256Hex(`${check.normalizedName}|${check.normalizedPhone}|${d.id}`)),
+  ]);
+  const uniqueIds = Array.from(new Set(candidateIds));
+
   try {
-    const snap = await getDocFromServer(doc(db, 'bookings', bookingId));
-    if (!snap.exists()) {
+    const snaps = await Promise.all(
+      uniqueIds.map((id) => getDocFromServer(doc(db, 'bookings', id)))
+    );
+    const found: BookingRecord[] = [];
+    snaps.forEach((snap) => {
+      if (snap.exists()) {
+        found.push(mapBooking(snap.id, snap.data() as Record<string, unknown>));
+      }
+    });
+
+    if (found.length === 0) {
       return { status: 'not_found' };
     }
+
+    found.sort((a, b) => {
+      const dateA = dateOrderMap.get(a.travelDateId) ?? '';
+      const dateB = dateOrderMap.get(b.travelDateId) ?? '';
+      if (dateA !== dateB) return dateA.localeCompare(dateB);
+      return a.createdAtMs - b.createdAtMs;
+    });
+
     return {
       status: 'found',
-      booking: mapBooking(snap.id, snap.data() as Record<string, unknown>),
+      bookings: found,
     };
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `bookings/${bookingId}`);
+    handleFirestoreError(error, OperationType.GET, 'bookings/lookup');
   }
 }
 
 // -----------------------------------------------------------------------------
 // Admin-only Firestore operations (protected by firestore.rules isAdmin())
 // -----------------------------------------------------------------------------
-
-export async function ensureBookingCounterInitialized(): Promise<void> {
-  const counterRef = doc(db, 'counters', 'booking');
-  try {
-    const snap = await getDoc(counterRef);
-    if (!snap.exists()) {
-      await setDoc(counterRef, {
-        lastNumber: 0,
-        lastBookingId: 'INIT',
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'counters/booking');
-  }
-}
 
 export async function adminFetchAllBookings(): Promise<BookingRecord[]> {
   try {
@@ -350,6 +448,20 @@ export async function adminFetchAllBookings(): Promise<BookingRecord[]> {
     return snap.docs.map((d) => mapBooking(d.id, d.data() as Record<string, unknown>));
   } catch (error) {
     handleFirestoreError(error, OperationType.LIST, 'bookings');
+  }
+}
+
+export async function adminFetchBookingsByTravelDate(
+  travelDateId: string
+): Promise<BookingRecord[]> {
+  try {
+    const q = query(collection(db, 'bookings'), where('travelDateId', '==', travelDateId));
+    const snap = await getDocs(q);
+    const list = snap.docs.map((d) => mapBooking(d.id, d.data() as Record<string, unknown>));
+    list.sort((a, b) => parseBookingSequence(a.bookingNumber) - parseBookingSequence(b.bookingNumber));
+    return list;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, `bookings?travelDateId=${travelDateId}`);
   }
 }
 
@@ -365,11 +477,10 @@ export async function adminCreateTravelDate(
     throw new Error('Capacity must be a whole number between 1 and 10,000.');
   }
 
-  await ensureBookingCounterInitialized();
-
   const id = `td_${isoDate.replace(/-/g, '')}_${Math.random().toString(36).slice(2, 7)}`;
   const label = formatTravelDateLabel(isoDate);
   const dateRef = doc(db, 'travelDates', id);
+  const dateCounterRef = doc(db, 'dateCounters', id);
 
   try {
     await setDoc(dateRef, {
@@ -379,6 +490,11 @@ export async function adminCreateTravelDate(
       bookedCount: 0,
       isOpen,
       createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    await setDoc(dateCounterRef, {
+      lastNumber: 0,
+      lastBookingId: 'INIT',
       updatedAt: serverTimestamp(),
     });
     const snap = await getDocFromServer(dateRef);
@@ -433,38 +549,91 @@ export async function adminUpdateTravelDate(
   }
 }
 
-export async function adminDeleteBooking(booking: BookingRecord): Promise<void> {
+export type CancelBookingResult =
+  | { status: 'cancelled' }
+  | { status: 'already_cancelled' }
+  | { status: 'not_found' };
+
+export async function adminCancelBooking(booking: BookingRecord): Promise<CancelBookingResult> {
   const bookingRef = doc(db, 'bookings', booking.id);
-  const phoneLockRef = doc(db, 'phoneLocks', booking.phoneHash);
   const dateRef = doc(db, 'travelDates', booking.travelDateId);
 
   try {
-    await runTransaction(db, async (tx) => {
+    return await runTransaction(db, async (tx) => {
       const bookingSnap = await tx.get(bookingRef);
       if (!bookingSnap.exists()) {
-        return;
+        return { status: 'not_found' as const };
       }
 
-      const lockSnap = await tx.get(phoneLockRef);
-      const dateSnap = await tx.get(dateRef);
+      const currentStatus = (bookingSnap.data() as { status?: string }).status;
+      if (currentStatus === 'Cancelled') {
+        return { status: 'already_cancelled' as const };
+      }
 
+      const dateSnap = await tx.get(dateRef);
       if (dateSnap.exists()) {
         const currentBooked = Number((dateSnap.data() as { bookedCount: number }).bookedCount ?? 0);
-        if (currentBooked >= 1) {
-          tx.update(dateRef, {
-            bookedCount: currentBooked - 1,
-            updatedAt: serverTimestamp(),
-          });
+        if (currentBooked < 1) {
+          throw new Error('Cannot restore capacity below zero.');
         }
+        tx.update(dateRef, {
+          bookedCount: currentBooked - 1,
+          updatedAt: serverTimestamp(),
+        });
       }
 
-      if (lockSnap.exists()) {
-        tx.delete(phoneLockRef);
-      }
+      tx.update(bookingRef, {
+        status: 'Cancelled',
+        cancelledAt: serverTimestamp(),
+      });
 
-      tx.delete(bookingRef);
+      return { status: 'cancelled' as const };
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `bookings/${booking.id}`);
+    handleFirestoreError(error, OperationType.UPDATE, `bookings/${booking.id}`);
+  }
+}
+
+export async function adminSaveContactSettings(
+  adminPhone: string,
+  telegramInput: string
+): Promise<ContactSettingsRecord> {
+  const cleanPhone = adminPhone.trim();
+  const cleanTelegram = telegramInput.trim();
+
+  if (cleanPhone.length > 32) {
+    throw new Error('Phone number must be 32 characters or fewer.');
+  }
+  if (cleanPhone.length > 0) {
+    if (!/^[0-9+\-\s().]{6,32}$/.test(cleanPhone) || !normalizeTelHref(cleanPhone)) {
+      throw new Error('Please enter a valid phone number (6-24 digits).');
+    }
+  }
+
+  if (cleanTelegram.length > 160) {
+    throw new Error('Telegram username or link is too long.');
+  }
+  if (cleanTelegram.length > 0 && !normalizeTelegramLink(cleanTelegram)) {
+    throw new Error(
+      'Please enter a valid Telegram username (e.g., @username) or link (e.g., https://t.me/username).'
+    );
+  }
+
+  const contactRef = doc(db, 'settings', 'contact');
+  try {
+    await setDoc(contactRef, {
+      adminPhone: cleanPhone,
+      telegramInput: cleanTelegram,
+      updatedAt: serverTimestamp(),
+    });
+    const snap = await getDocFromServer(contactRef);
+    const data = (snap.data() ?? {}) as Record<string, unknown>;
+    return {
+      adminPhone: String(data.adminPhone ?? cleanPhone),
+      telegramInput: String(data.telegramInput ?? cleanTelegram),
+      updatedAtMs: data.updatedAt instanceof Timestamp ? data.updatedAt.toMillis() : Date.now(),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'settings/contact');
   }
 }

@@ -66,10 +66,16 @@ export function BookingReceiptCard({
             {booking.bookingNumber}
           </p>
         </div>
-        <div className="inline-flex items-center gap-1.5 text-sm font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-1.5">
-          <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0" />
-          <span>{t.statusConfirmed}</span>
-        </div>
+        {booking.status === 'Cancelled' ? (
+          <div className="inline-flex items-center gap-1.5 text-sm font-semibold text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5">
+            <span>{t.statusCancelled}</span>
+          </div>
+        ) : (
+          <div className="inline-flex items-center gap-1.5 text-sm font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg px-3 py-1.5">
+            <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0" />
+            <span>{t.statusConfirmed}</span>
+          </div>
+        )}
       </div>
 
       {/* Details Grid */}
@@ -104,16 +110,28 @@ export function BookingReceiptCard({
 
         <div className="py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
           <span className="text-xs font-medium text-slate-500">{t.receiptStatus}</span>
-          <span className="text-sm font-semibold text-teal-800">{t.statusConfirmed}</span>
+          <span
+            className={`text-sm font-semibold ${
+              booking.status === 'Cancelled' ? 'text-rose-700' : 'text-teal-800'
+            }`}
+          >
+            {booking.status === 'Cancelled' ? t.statusCancelled : t.statusConfirmed}
+          </span>
         </div>
       </div>
 
       {/* Boarding & Payment Notice */}
-      <div className="mx-5 mb-5 sm:mx-6 sm:mb-6 p-4 rounded-xl bg-teal-50/70 border border-teal-200/80 space-y-1.5">
-        <p className="text-sm font-semibold text-[#0F3D5E]">{trip.paymentRule}</p>
-        <p className="text-xs sm:text-sm text-teal-900 leading-relaxed">{trip.boardingRule}</p>
-        <p className="text-xs text-slate-600 leading-relaxed">{trip.pier}</p>
-      </div>
+      {booking.status === 'Cancelled' ? (
+        <div className="mx-5 mb-5 sm:mx-6 sm:mb-6 p-4 rounded-xl bg-rose-50 border border-rose-200 space-y-1.5">
+          <p className="text-sm font-semibold text-rose-900">{t.cancelledReceiptNote}</p>
+        </div>
+      ) : (
+        <div className="mx-5 mb-5 sm:mx-6 sm:mb-6 p-4 rounded-xl bg-teal-50/70 border border-teal-200/80 space-y-1.5">
+          <p className="text-sm font-semibold text-[#0F3D5E]">{trip.paymentRule}</p>
+          <p className="text-xs sm:text-sm text-teal-900 leading-relaxed">{trip.boardingRule}</p>
+          <p className="text-xs text-slate-600 leading-relaxed">{trip.pier}</p>
+        </div>
+      )}
 
       {/* Action Button */}
       <div className="px-5 pb-5 sm:px-6 sm:pb-6">

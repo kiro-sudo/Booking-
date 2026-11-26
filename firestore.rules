@@ -93,8 +93,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'bookingNumber', 'customerName', 'normalizedName', 'phone',
-          'normalizedPhone', 'phoneHash', 'travelDateId', 'travelDateLabel',
-          'status', 'tripName', 'createdAt'
+          'normalizedPhone', 'phoneHash', 'datePhoneHash', 'travelDateId', 'travelDateLabel',
+          'status', 'tripName', 'createdAt', 'cancelledAt'
         ])
         && data.bookingNumber is string
         && data.bookingNumber.size() >= 4
@@ -116,6 +116,11 @@ service cloud.firestore {
         && data.phoneHash is string
         && data.phoneHash.size() == 64
         && data.phoneHash.matches('^[a-f0-9]{64}$')
+        && (!('datePhoneHash' in data) || (
+          data.datePhoneHash is string
+          && data.datePhoneHash.size() == 64
+          && data.datePhoneHash.matches('^[a-f0-9]{64}$')
+        ))
         && data.travelDateId is string
         && data.travelDateId.size() >= 3
         && data.travelDateId.size() <= 64
@@ -123,8 +128,9 @@ service cloud.firestore {
         && data.travelDateLabel is string
         && data.travelDateLabel.size() >= 3
         && data.travelDateLabel.size() <= 64
+        && (!('cancelledAt' in data) || data.cancelledAt is timestamp)
         && data.status is string
-        && data.status == 'Confirmed'
+        && (data.status == 'Confirmed' || data.status == 'Cancelled')
         && data.tripName is string
         && data.tripName.size() >= 2
         && data.tripName.size() <= 120
@@ -140,6 +146,17 @@ service cloud.firestore {
         && data.role is string
         && data.role == 'admin'
         && data.createdAt is timestamp;
+    }
+
+    function isValidContactSettings(data) {
+      return data.keys().hasAll(['adminPhone', 'telegramInput', 'updatedAt'])
+        && data.keys().hasOnly(['adminPhone', 'telegramInput', 'updatedAt'])
+        && data.adminPhone is string
+        && data.adminPhone.size() <= 32
+        && (data.adminPhone.size() == 0 || data.adminPhone.matches('^[0-9+\\-\\s().]{6,32}$'))
+        && data.telegramInput is string
+        && data.telegramInput.size() <= 160
+        && data.updatedAt is timestamp;
     }
 
     // -------------------------------------------------------------------------
@@ -174,15 +191,24 @@ service cloud.firestore {
           && incoming().capacity >= existing().bookedCount
           && incoming().updatedAt == request.time
         ) ||
-        // Action 2: Atomic booking capacity increment paired with global counter increment
+        // Action 2: Atomic booking capacity increment paired with per-date counter increment
         (
           incoming().diff(existing()).affectedKeys().hasOnly(['bookedCount', 'updatedAt'])
           && existing().isOpen == true
           && incoming().bookedCount == existing().bookedCount + 1
           && incoming().bookedCount <= existing().capacity
           && incoming().updatedAt == request.time
-          && getAfter(/databases/$(database)/documents/counters/booking).data.lastNumber
-             == get(/databases/$(database)/documents/counters/booking).data.lastNumber + 1
+          && getAfter(/databases/$(database)/documents/dateCounters/$(dateId)).data.lastBookingId != 'INIT'
+          && (
+            (
+              !exists(/databases/$(database)/documents/dateCounters/$(dateId))
+              && getAfter(/databases/$(database)/documents/dateCounters/$(dateId)).data.lastNumber == 1
+            ) || (
+              exists(/databases/$(database)/documents/dateCounters/$(dateId))
+              && getAfter(/databases/$(database)/documents/dateCounters/$(dateId)).data.lastNumber
+                 == get(/databases/$(database)/documents/dateCounters/$(dateId)).data.lastNumber + 1
+            )
+          )
         ) ||
         // Action 3: Admin booking cancellation decrement
         (
@@ -199,31 +225,47 @@ service cloud.firestore {
         && existing().bookedCount == 0;
     }
 
-    // Monotonic global booking sequence counter (never reset, never deleted)
+    // Legacy global counter (read-only/frozen)
     match /counters/{counterId} {
       allow get: if isValidId(counterId) && counterId == 'booking';
-      allow list, delete: if false;
-
-      allow create: if isAdmin()
-        && counterId == 'booking'
-        && isValidCounter(incoming())
-        && incoming().lastNumber == 0
-        && incoming().lastBookingId == 'INIT'
-        && incoming().updatedAt == request.time;
-
-      allow update: if counterId == 'booking' && isValidCounter(incoming()) && (
-        // Atomic increment paired with new booking creation in same transaction
-        (
-          incoming().diff(existing()).affectedKeys().hasOnly(['lastNumber', 'lastBookingId', 'updatedAt'])
-          && incoming().lastNumber == existing().lastNumber + 1
-          && incoming().updatedAt == request.time
-          && getAfter(/databases/$(database)/documents/bookings/$(incoming().lastBookingId)).data.bookingNumber
-             == 'BT-' + string(incoming().lastNumber)
-        )
-      );
+      allow list, write: if false;
     }
 
-    // Phone uniqueness locks (cryptographic SHA-256 hashes only, zero PII)
+    // Per-travel-date monotonic booking sequence counters (BT-1, BT-2, ... per dateId; never reset)
+    match /dateCounters/{dateId} {
+      allow get: if isValidId(dateId);
+      allow list, delete: if false;
+
+      allow create: if isValidId(dateId)
+        && isValidCounter(incoming())
+        && exists(/databases/$(database)/documents/travelDates/$(dateId))
+        && incoming().updatedAt == request.time
+        && (
+          (
+            isAdmin()
+            && incoming().lastNumber == 0
+            && incoming().lastBookingId == 'INIT'
+          ) || (
+            incoming().lastNumber == 1
+            && incoming().lastBookingId != 'INIT'
+            && getAfter(/databases/$(database)/documents/bookings/$(incoming().lastBookingId)).data.bookingNumber == 'BT-1'
+            && getAfter(/databases/$(database)/documents/bookings/$(incoming().lastBookingId)).data.travelDateId == dateId
+          )
+        );
+
+      allow update: if isValidId(dateId)
+        && isValidCounter(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['lastNumber', 'lastBookingId', 'updatedAt'])
+        && incoming().lastNumber == existing().lastNumber + 1
+        && incoming().lastBookingId != 'INIT'
+        && incoming().updatedAt == request.time
+        && getAfter(/databases/$(database)/documents/bookings/$(incoming().lastBookingId)).data.bookingNumber
+           == 'BT-' + string(incoming().lastNumber)
+        && getAfter(/databases/$(database)/documents/bookings/$(incoming().lastBookingId)).data.travelDateId
+           == dateId;
+    }
+
+    // Per-date phone uniqueness locks (cryptographic SHA-256 hashes only, zero PII)
     match /phoneLocks/{phoneHash} {
       allow get: if isAdmin() || (isValidId(phoneHash) && phoneHash.size() == 64);
       allow list: if isAdmin();
@@ -233,13 +275,13 @@ service cloud.firestore {
         && isValidPhoneLock(incoming())
         && !exists(/databases/$(database)/documents/phoneLocks/$(phoneHash))
         && incoming().createdAt == request.time
-        && getAfter(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.phoneHash == phoneHash
+        && getAfter(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.datePhoneHash == phoneHash
         && getAfter(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.bookingNumber == incoming().bookingNumber;
 
       allow update, delete: if isAdmin();
     }
 
-    // Customer bookings (keyed by SHA-256(normalizedName + '|' + normalizedPhone))
+    // Customer bookings (keyed by SHA-256(normalizedName + '|' + normalizedPhone + '|' + travelDateId))
     match /bookings/{bookingId} {
       allow get: if isAdmin() || (isValidId(bookingId) && bookingId.size() == 64);
       allow list: if isAdmin();
@@ -247,25 +289,73 @@ service cloud.firestore {
       allow create: if isValidId(bookingId)
         && bookingId.size() == 64
         && isValidBooking(incoming())
+        && ('datePhoneHash' in incoming())
+        && !('cancelledAt' in incoming())
         && incoming().createdAt == request.time
         && incoming().status == 'Confirmed'
-        && getAfter(/databases/$(database)/documents/counters/booking).data.lastNumber
-           == get(/databases/$(database)/documents/counters/booking).data.lastNumber + 1
-        && getAfter(/databases/$(database)/documents/counters/booking).data.lastBookingId == bookingId
+        && exists(/databases/$(database)/documents/travelDates/$(incoming().travelDateId))
+        && get(/databases/$(database)/documents/travelDates/$(incoming().travelDateId)).data.label
+           == incoming().travelDateLabel
+        && getAfter(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId)).data.lastBookingId
+           == bookingId
+        && (
+          (
+            !exists(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId))
+            && getAfter(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId)).data.lastNumber == 1
+          ) || (
+            exists(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId))
+            && getAfter(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId)).data.lastNumber
+               == get(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId)).data.lastNumber + 1
+          )
+        )
         && incoming().bookingNumber
-           == 'BT-' + string(getAfter(/databases/$(database)/documents/counters/booking).data.lastNumber)
+           == 'BT-' + string(getAfter(/databases/$(database)/documents/dateCounters/$(incoming().travelDateId)).data.lastNumber)
         && getAfter(/databases/$(database)/documents/travelDates/$(incoming().travelDateId)).data.bookedCount
            == get(/databases/$(database)/documents/travelDates/$(incoming().travelDateId)).data.bookedCount + 1
-        && existsAfter(/databases/$(database)/documents/phoneLocks/$(incoming().phoneHash));
+        && existsAfter(/databases/$(database)/documents/phoneLocks/$(incoming().datePhoneHash));
 
       allow update: if isAdmin()
         && isValidId(bookingId)
         && isValidBooking(incoming())
-        && incoming().diff(existing()).affectedKeys().hasOnly(['travelDateLabel', 'travelDateId'])
         && incoming().bookingNumber == existing().bookingNumber
-        && incoming().createdAt == existing().createdAt;
+        && incoming().createdAt == existing().createdAt
+        && incoming().customerName == existing().customerName
+        && incoming().normalizedName == existing().normalizedName
+        && incoming().phone == existing().phone
+        && incoming().normalizedPhone == existing().normalizedPhone
+        && incoming().phoneHash == existing().phoneHash
+        && (
+          // Update A: Keep travelDateLabel synced when admin edits a travel date
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['travelDateLabel', 'travelDateId'])
+            && incoming().status == existing().status
+          ) ||
+          // Update B: Atomic Admin cancellation (Confirmed -> Cancelled) restoring daily capacity
+          (
+            existing().status == 'Confirmed'
+            && incoming().status == 'Cancelled'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'cancelledAt'])
+            && incoming().cancelledAt == request.time
+            && incoming().travelDateId == existing().travelDateId
+            && incoming().travelDateLabel == existing().travelDateLabel
+            && getAfter(/databases/$(database)/documents/travelDates/$(existing().travelDateId)).data.bookedCount
+               == get(/databases/$(database)/documents/travelDates/$(existing().travelDateId)).data.bookedCount - 1
+          )
+        );
 
-      allow delete: if isAdmin() && isValidId(bookingId);
+      // Cancelled and confirmed bookings are preserved as historical records
+      allow delete: if false;
+    }
+
+    // Public customer support contact settings (Admin write only)
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && settingId == 'contact';
+      allow list, delete: if false;
+      allow create, update: if isAdmin()
+        && isValidId(settingId)
+        && settingId == 'contact'
+        && isValidContactSettings(incoming())
+        && incoming().updatedAt == request.time;
     }
 
     // Admin registry
