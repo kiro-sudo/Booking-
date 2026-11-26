@@ -6,6 +6,7 @@ import {
   AlertCircle,
   CalendarPlus,
   CheckCircle2,
+  Clock,
   Download,
   Edit3,
   Eye,
@@ -14,6 +15,7 @@ import {
   Search,
   ShieldCheck,
   Ship,
+  Trash2,
   X,
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
@@ -21,11 +23,12 @@ import { collection, onSnapshot, orderBy, query, Timestamp } from 'firebase/fire
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from '@/lib/firebase';
 import {
   adminCreateTravelDate,
+  adminDeleteBooking,
   adminUpdateTravelDate,
   BookingRecord,
   TravelDateRecord,
 } from '@/lib/booking-helpers';
-import { formatServerTimestamp, Locale, TRIP_INFO } from '@/lib/i18n';
+import { formatServerTimestamp, getTripCapacityState, Locale, TRIP_INFO } from '@/lib/i18n';
 import { BookingReceiptCard } from './BookingReceiptCard';
 
 const ADMIN_ALLOWLIST_EMAIL = 'zwalpyaes@gmail.com';
@@ -61,6 +64,9 @@ export function AdminPortal() {
   const [searchQuery, setSearchQuery] = useState('');
   const [dateFilterId, setDateFilterId] = useState<string>('all');
   const [selectedBooking, setSelectedBooking] = useState<BookingRecord | null>(null);
+  const [bookingToDelete, setBookingToDelete] = useState<BookingRecord | null>(null);
+  const [deletingBooking, setDeletingBooking] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Add travel date form state
   const [newDate, setNewDate] = useState('');
@@ -352,6 +358,24 @@ export function AdminPortal() {
       setEditError(err instanceof Error ? err.message : 'Failed to update travel date.');
     } finally {
       setSavingEdit(false);
+    }
+  };
+
+  const handleConfirmDeleteBooking = async () => {
+    if (!bookingToDelete || deletingBooking) return;
+    setDeleteError(null);
+    setDeletingBooking(true);
+
+    try {
+      await adminDeleteBooking(bookingToDelete);
+      if (selectedBooking?.id === bookingToDelete.id) {
+        setSelectedBooking(null);
+      }
+      setBookingToDelete(null);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Failed to delete booking.');
+    } finally {
+      setDeletingBooking(false);
     }
   };
 
@@ -905,14 +929,28 @@ export function AdminPortal() {
                             {formatServerTimestamp(b.createdAtMs, 'en')}
                           </td>
                           <td className="py-3.5 px-5 text-right whitespace-nowrap">
-                            <button
-                              type="button"
-                              onClick={() => setSelectedBooking(b)}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
-                            >
-                              <Eye className="w-3.5 h-3.5" />
-                              <span>View</span>
-                            </button>
+                            <div className="inline-flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setSelectedBooking(b)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                                <span>View</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDeleteError(null);
+                                  setBookingToDelete(b);
+                                }}
+                                aria-label={`Delete booking ${b.bookingNumber}`}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Delete</span>
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -928,14 +966,28 @@ export function AdminPortal() {
                         <span className="font-mono tabular-nums text-base font-bold text-[#0F3D5E]">
                           {b.bookingNumber}
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => setSelectedBooking(b)}
-                          className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800"
-                        >
-                          <Eye className="w-3.5 h-3.5" />
-                          <span>Details</span>
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedBooking(b)}
+                            className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>Details</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDeleteError(null);
+                              setBookingToDelete(b);
+                            }}
+                            aria-label={`Delete booking ${b.bookingNumber}`}
+                            className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50/60 text-xs font-semibold text-rose-700"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete</span>
+                          </button>
+                        </div>
                       </div>
                       <p className="font-semibold text-slate-900">{b.customerName}</p>
                       <div className="text-xs text-slate-600 space-y-1">
@@ -1062,7 +1114,7 @@ export function AdminPortal() {
                     <tbody className="divide-y divide-slate-100 text-sm">
                       {travelDates.map((td) => {
                         const remaining = Math.max(0, td.capacity - td.bookedCount);
-                        const isFull = remaining === 0;
+                        const state = getTripCapacityState(td.capacity, td.bookedCount, td.isOpen);
                         return (
                           <tr key={td.id} className="hover:bg-slate-50/80 transition-colors">
                             <td className="py-3.5 px-5">
@@ -1083,20 +1135,30 @@ export function AdminPortal() {
                             <td className="py-3.5 px-4 text-right whitespace-nowrap">
                               <span
                                 className={`inline-flex items-center gap-1 text-xs font-semibold ${
-                                  !td.isOpen
-                                    ? 'text-slate-500'
-                                    : isFull
+                                  state === 'closed'
+                                    ? 'text-slate-600'
+                                    : state === 'sold_out'
+                                    ? 'text-rose-700'
+                                    : state === 'filling_up'
                                     ? 'text-amber-700'
                                     : 'text-teal-700'
                                 }`}
                               >
-                                {isFull || !td.isOpen ? (
+                                {state === 'closed' || state === 'sold_out' ? (
                                   <Lock className="w-3.5 h-3.5" />
+                                ) : state === 'filling_up' ? (
+                                  <Clock className="w-3.5 h-3.5" />
                                 ) : (
                                   <CheckCircle2 className="w-3.5 h-3.5" />
                                 )}
                                 <span>
-                                  {!td.isOpen ? 'Closed' : isFull ? 'Full' : 'Open'}
+                                  {state === 'closed'
+                                    ? 'Closed'
+                                    : state === 'sold_out'
+                                    ? 'Sold Out'
+                                    : state === 'filling_up'
+                                    ? 'Filling Up'
+                                    : 'Available'}
                                 </span>
                               </span>
                             </td>
@@ -1130,7 +1192,18 @@ export function AdminPortal() {
           className="fixed inset-0 z-50 bg-slate-950/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
         >
           <div className="max-w-lg w-full space-y-3 my-auto">
-            <div className="flex justify-end">
+            <div className="flex items-center justify-between gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setDeleteError(null);
+                  setBookingToDelete(selectedBooking);
+                }}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 text-white text-xs font-semibold hover:bg-rose-700 shadow cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Delete Booking</span>
+              </button>
               <button
                 type="button"
                 onClick={() => setSelectedBooking(null)}
@@ -1141,6 +1214,69 @@ export function AdminPortal() {
               </button>
             </div>
             <BookingReceiptCard booking={selectedBooking} locale={locale} />
+          </div>
+        </div>
+      )}
+
+      {/* Delete Booking Confirmation Modal */}
+      {bookingToDelete && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-[60] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-6 space-y-5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <h3 className="font-display text-lg font-bold text-slate-900">
+                  Delete Booking {bookingToDelete.bookingNumber}?
+                </h3>
+                <p className="text-sm text-slate-600 leading-relaxed">
+                  This will remove the booking for{' '}
+                  <span className="font-semibold text-slate-900">
+                    {bookingToDelete.customerName}
+                  </span>{' '}
+                  (<span className="font-mono">{bookingToDelete.phone}</span>), release their seat on{' '}
+                  <span className="font-semibold text-slate-900">
+                    {bookingToDelete.travelDateLabel}
+                  </span>
+                  , and allow that phone number to book again.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setBookingToDelete(null)}
+                aria-label="Cancel delete"
+                className="w-9 h-9 rounded-lg border border-slate-200 flex items-center justify-center text-slate-600 hover:bg-slate-50 shrink-0 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {deleteError && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-900">
+                {deleteError}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setBookingToDelete(null)}
+                disabled={deletingBooking}
+                className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteBooking}
+                disabled={deletingBooking}
+                className="min-h-[42px] px-5 py-2 rounded-xl bg-rose-600 text-white text-sm font-semibold hover:bg-rose-700 disabled:opacity-60 cursor-pointer"
+              >
+                {deletingBooking ? 'Deleting...' : 'Confirm Delete'}
+              </button>
+            </div>
           </div>
         </div>
       )}

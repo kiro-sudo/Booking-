@@ -30,7 +30,7 @@ export const DIRTY_DOZEN_PAYLOADS: DirtyPayloadCase[] = [
       travelDateId: 'td_1',
       travelDateLabel: 'November 1, 2026',
       status: 'Confirmed',
-      tripName: 'Irrawaddy Horizon Cruise',
+      tripName: 'Mergui short boat trip',
       isVip: true,
     },
     expectedOutcome: 'PERMISSION_DENIED',

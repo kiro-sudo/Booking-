@@ -6,6 +6,7 @@ import {
   AlertCircle,
   Calendar,
   CheckCircle2,
+  Clock,
   Lock,
   Search,
   Ship,
@@ -19,8 +20,48 @@ import {
   lookupCustomerBooking,
   TravelDateRecord,
 } from '@/lib/booking-helpers';
-import { COPY, Locale, TRIP_INFO } from '@/lib/i18n';
+import { COPY, getTripCapacityState, Locale, TRIP_INFO, TripCapacityState } from '@/lib/i18n';
 import { BookingReceiptCard } from './BookingReceiptCard';
+
+function CapacityStatusLabel({
+  state,
+  locale,
+}: {
+  state: TripCapacityState;
+  locale: Locale;
+}) {
+  const t = COPY[locale];
+  if (state === 'closed') {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-semibold text-slate-600">
+        <Lock className="w-3.5 h-3.5 shrink-0" />
+        <span>{t.statusClosed}</span>
+      </span>
+    );
+  }
+  if (state === 'sold_out') {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-semibold text-rose-700">
+        <Lock className="w-3.5 h-3.5 shrink-0" />
+        <span>{t.statusSoldOut}</span>
+      </span>
+    );
+  }
+  if (state === 'filling_up') {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-700">
+        <Clock className="w-3.5 h-3.5 shrink-0" />
+        <span>{t.statusFillingUp}</span>
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 text-xs font-semibold text-teal-700">
+      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+      <span>{t.statusAvailable}</span>
+    </span>
+  );
+}
 
 export function CustomerBookingPortal() {
   const [locale, setLocale] = useState<Locale>('en');
@@ -309,13 +350,29 @@ export function CustomerBookingPortal() {
 
             <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
               <p className="text-xs font-medium text-slate-500">{t.remainingSeats}</p>
-              <p className="mt-1.5 font-mono tabular-nums text-lg font-bold text-[#0F3D5E]">
-                {scheduleLoading
-                  ? '...'
-                  : scheduleSummary.earliest
-                  ? `${scheduleSummary.earliest.capacity - scheduleSummary.earliest.bookedCount} ${t.seatsUnit}`
-                  : `0 ${t.seatsUnit}`}
-              </p>
+              <div className="mt-1.5 flex items-baseline justify-between gap-2">
+                <p className="font-mono tabular-nums text-lg font-bold text-[#0F3D5E]">
+                  {scheduleLoading
+                    ? '...'
+                    : scheduleSummary.earliest
+                    ? `${scheduleSummary.earliest.capacity - scheduleSummary.earliest.bookedCount} ${t.seatsUnit}`
+                    : `0 ${t.seatsUnit}`}
+                </p>
+                {!scheduleLoading && (
+                  <CapacityStatusLabel
+                    state={
+                      scheduleSummary.earliest
+                        ? getTripCapacityState(
+                            scheduleSummary.earliest.capacity,
+                            scheduleSummary.earliest.bookedCount,
+                            scheduleSummary.earliest.isOpen
+                          )
+                        : 'sold_out'
+                    }
+                    locale={locale}
+                  />
+                )}
+              </div>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5">
@@ -344,6 +401,42 @@ export function CustomerBookingPortal() {
                   </h2>
                   <p className="text-sm text-slate-600 leading-relaxed">{t.bookSectionSub}</p>
                 </div>
+
+                {/* Live Capacity Status Banner for Current Assignable Trip */}
+                {!scheduleLoading && (
+                  <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs text-slate-600 space-y-0.5">
+                      <p className="font-medium text-slate-500">
+                        {scheduleSummary.earliest ? t.nextTripLabel : t.currentTripStatus}
+                      </p>
+                      <p className="font-semibold text-sm text-slate-900 tabular-nums">
+                        {scheduleSummary.earliest ? (
+                          <>
+                            {scheduleSummary.earliest.label}
+                            <span className="mx-1.5 text-slate-400" aria-hidden="true">·</span>
+                            <span className="font-mono">
+                              {scheduleSummary.earliest.capacity - scheduleSummary.earliest.bookedCount}/{scheduleSummary.earliest.capacity} {t.seatsUnit}
+                            </span>
+                          </>
+                        ) : (
+                          t.noDatesAvailable
+                        )}
+                      </p>
+                    </div>
+                    <CapacityStatusLabel
+                      state={
+                        scheduleSummary.earliest
+                          ? getTripCapacityState(
+                              scheduleSummary.earliest.capacity,
+                              scheduleSummary.earliest.bookedCount,
+                              scheduleSummary.earliest.isOpen
+                            )
+                          : 'sold_out'
+                      }
+                      locale={locale}
+                    />
+                  </div>
+                )}
 
                 <form onSubmit={handleBookingSubmit} className="space-y-5">
                   <div className="space-y-2">
@@ -537,16 +630,26 @@ export function CustomerBookingPortal() {
                     <tbody className="divide-y divide-slate-100 text-sm">
                       {travelDates.map((td) => {
                         const remaining = Math.max(0, td.capacity - td.bookedCount);
-                        const isFull = remaining === 0;
-                        const statusText = !td.isOpen
-                          ? t.statusClosed
-                          : isFull
-                          ? t.statusFull
-                          : t.statusOpen;
+                        const state = getTripCapacityState(td.capacity, td.bookedCount, td.isOpen);
+                        const fillPct = Math.min(100, Math.round((td.bookedCount / Math.max(1, td.capacity)) * 100));
                         return (
                           <tr key={td.id} className="hover:bg-slate-50/80 transition-colors">
                             <td className="py-3.5 px-5 font-medium text-slate-900 whitespace-nowrap">
-                              {td.label}
+                              <div>{td.label}</div>
+                              <div className="mt-1.5 w-24 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full ${
+                                    state === 'sold_out'
+                                      ? 'bg-rose-600'
+                                      : state === 'filling_up'
+                                      ? 'bg-amber-600'
+                                      : state === 'closed'
+                                      ? 'bg-slate-400'
+                                      : 'bg-teal-600'
+                                  }`}
+                                  style={{ width: `${fillPct}%` }}
+                                />
+                              </div>
                             </td>
                             <td className="py-3.5 px-4 text-right font-mono tabular-nums text-slate-700">
                               {td.capacity}
@@ -558,22 +661,7 @@ export function CustomerBookingPortal() {
                               {remaining}
                             </td>
                             <td className="py-3.5 px-5 text-right whitespace-nowrap">
-                              <span
-                                className={`inline-flex items-center gap-1 text-xs font-semibold ${
-                                  !td.isOpen
-                                    ? 'text-slate-500'
-                                    : isFull
-                                    ? 'text-amber-700'
-                                    : 'text-teal-700'
-                                }`}
-                              >
-                                {isFull || !td.isOpen ? (
-                                  <Lock className="w-3.5 h-3.5 shrink-0" />
-                                ) : (
-                                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                                )}
-                                <span>{statusText}</span>
-                              </span>
+                              <CapacityStatusLabel state={state} locale={locale} />
                             </td>
                           </tr>
                         );

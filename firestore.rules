@@ -183,6 +183,14 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && getAfter(/databases/$(database)/documents/counters/booking).data.lastNumber
              == get(/databases/$(database)/documents/counters/booking).data.lastNumber + 1
+        ) ||
+        // Action 3: Admin booking cancellation decrement
+        (
+          isAdmin()
+          && incoming().diff(existing()).affectedKeys().hasOnly(['bookedCount', 'updatedAt'])
+          && existing().bookedCount >= 1
+          && incoming().bookedCount == existing().bookedCount - 1
+          && incoming().updatedAt == request.time
         )
       );
 

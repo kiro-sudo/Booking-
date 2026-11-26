@@ -87,9 +87,12 @@ export const COPY = {
     colBooked: 'Booked',
     colRemaining: 'Remaining',
     colStatus: 'Status',
-    statusOpen: 'Open',
-    statusFull: 'Full',
+    statusAvailable: 'Available',
+    statusFillingUp: 'Filling Up',
+    statusSoldOut: 'Sold Out',
     statusClosed: 'Closed',
+    nextTripLabel: 'Next Assigned Trip',
+    currentTripStatus: 'Current Trip Status',
     noScheduleYet: 'No upcoming travel dates configured yet.',
     deckTitle: 'Boarding & Onboard Notes',
     deckPoint1: 'The departure time depends on the tides. Please confirm boarding time on your travel date.',
@@ -161,9 +164,12 @@ export const COPY = {
     colBooked: 'ဘိုကင်ပြီး',
     colRemaining: 'ကျန်ရှိ',
     colStatus: 'အခြေအနေ',
-    statusOpen: 'ဖွင့်ထားသည်',
-    statusFull: 'ပြည့်ပြီ',
+    statusAvailable: 'ရရှိနိုင်သည်',
+    statusFillingUp: 'နေရာနည်းလာပြီ',
+    statusSoldOut: 'လက်မှတ်ကုန်ပြီ',
     statusClosed: 'ပိတ်ထားသည်',
+    nextTripLabel: 'နောက်ဆုံးသတ်မှတ်မည့် ခရီးစဉ်',
+    currentTripStatus: 'လက်ရှိခရီးစဉ် အခြေအနေ',
     noScheduleYet: 'ခရီးစဉ်ရက်စွဲများ ထည့်သွင်းထားခြင်း မရှိသေးပါ။',
     deckTitle: 'သင်္ဘောတက်ရောက်ခြင်းဆိုင်ရာ အချက်အလက်များ',
     deckPoint1: 'ထွက်ခွာချိန်သည် ဒီရေအတက်အကျပေါ် မူတည်ပါသည်။ ခရီးသွားမည့်နေ့တွင် ထွက်ခွာချိန်ကို စစ်ဆေးပေးပါ။',
@@ -182,6 +188,22 @@ export function formatTravelDateLabel(isoDate: string): string {
     day: 'numeric',
     year: 'numeric',
   });
+}
+
+export type TripCapacityState = 'available' | 'filling_up' | 'sold_out' | 'closed';
+
+export function getTripCapacityState(
+  capacity: number,
+  bookedCount: number,
+  isOpen: boolean
+): TripCapacityState {
+  if (!isOpen) return 'closed';
+  const remaining = Math.max(0, capacity - bookedCount);
+  if (remaining === 0) return 'sold_out';
+  if (bookedCount > 0 && (remaining <= 5 || remaining / Math.max(1, capacity) <= 0.3)) {
+    return 'filling_up';
+  }
+  return 'available';
 }
 
 export function formatServerTimestamp(ms: number, locale: Locale): string {

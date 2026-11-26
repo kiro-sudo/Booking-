@@ -432,3 +432,39 @@ export async function adminUpdateTravelDate(
     handleFirestoreError(error, OperationType.UPDATE, `travelDates/${dateId}`);
   }
 }
+
+export async function adminDeleteBooking(booking: BookingRecord): Promise<void> {
+  const bookingRef = doc(db, 'bookings', booking.id);
+  const phoneLockRef = doc(db, 'phoneLocks', booking.phoneHash);
+  const dateRef = doc(db, 'travelDates', booking.travelDateId);
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const bookingSnap = await tx.get(bookingRef);
+      if (!bookingSnap.exists()) {
+        return;
+      }
+
+      const lockSnap = await tx.get(phoneLockRef);
+      const dateSnap = await tx.get(dateRef);
+
+      if (dateSnap.exists()) {
+        const currentBooked = Number((dateSnap.data() as { bookedCount: number }).bookedCount ?? 0);
+        if (currentBooked >= 1) {
+          tx.update(dateRef, {
+            bookedCount: currentBooked - 1,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      if (lockSnap.exists()) {
+        tx.delete(phoneLockRef);
+      }
+
+      tx.delete(bookingRef);
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `bookings/${booking.id}`);
+  }
+}
